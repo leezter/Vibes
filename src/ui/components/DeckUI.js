@@ -33,7 +33,9 @@ export function createDeckUI(container, engine, id){
   const bpmLabel = document.createElement('span'); bpmLabel.textContent = 'BPM:'; bpmLabel.style.marginRight='6px';
   const bpmDetected = document.createElement('span'); bpmDetected.className='bpm-detected'; bpmDetected.textContent='—'; bpmDetected.style.marginRight='8px';
   const bpmTargetVal = document.createElement('span'); bpmTargetVal.className='bpm-target'; bpmTargetVal.textContent='120'; bpmTargetVal.style.margin='0 8px';
-  const bpmSlider = document.createElement('input'); bpmSlider.type='range'; bpmSlider.min=60; bpmSlider.max=180; bpmSlider.step=1; bpmSlider.value=120; bpmSlider.className='slider';
+  const bpmSlider = document.createElement('input'); bpmSlider.type='range'; bpmSlider.min=60; bpmSlider.max=180; bpmSlider.step=1; bpmSlider.className='slider';
+  // default slider visually centered between min and max
+  bpmSlider.value = String((parseInt(bpmSlider.min,10) + parseInt(bpmSlider.max,10)) / 2);
   bpmWrap.append(bpmLabel,bpmDetected,bpmTargetVal,bpmSlider);
   controls.appendChild(bpmWrap);
   const hotcueWrap=document.createElement('div'); hotcueWrap.className='hotcues';
@@ -159,12 +161,10 @@ export function createDeckUI(container, engine, id){
     platterComp.setSpinning(!!deck.playing);
     // label from track name if available
     if(deck && deck.file && deck.file.name) platterComp.setLabel(deck.file.name);
-    // rpm from detected BPM if present
-    const detected = deck.analysis && deck.analysis.bpm ? Math.round(deck.analysis.bpm) : null;
-    if(detected) {
-      // center RPM on beats per minute assuming 1 rev = 1 beat at BPM (visual scaling may vary)
-      platterComp.setRpm(detected);
-    }
+    // RPM driven by slider position: center of the slider is default rpm; moving slider left/right adjusts spin speed
+  const sliderVal = parseFloat(bpmSlider.value) || ((parseInt(bpmSlider.min,10) + parseInt(bpmSlider.max,10))/2);
+  // apply 50% scaling to reduce perceived spin speed
+  platterComp.setRpm(sliderVal * 0.5);
   }
   // call once to initialize label/spin
   updatePlatterFromDeck();
@@ -174,24 +174,45 @@ export function createDeckUI(container, engine, id){
 
   // update BPM UI when analysis completes
   function refreshBpmUI(){
-    const detected = deck.analysis && deck.analysis.bpm ? Math.round(deck.analysis.bpm) : null;
-    bpmDetected.textContent = detected? String(detected) : '—';
-    // if user hasn't changed the slider and we have a detected BPM, set the slider to that BPM
-    if(!bpmUserChanged && detected){
-      bpmSlider.value = String(detected);
+    const detected = deck.analysis && deck.analysis.bpm ? deck.analysis.bpm : null;
+    bpmDetected.textContent = detected? String(Math.round(detected)) : '—';
+    // compute slider center (midpoint of min/max)
+    const minVal = parseInt(bpmSlider.min,10) || 60;
+    const maxVal = parseInt(bpmSlider.max,10) || 180;
+    const center = (minVal + maxVal) / 2;
+    // Default behavior: if user hasn't touched slider, keep it visually centered.
+    if(!bpmUserChanged){
+      bpmSlider.value = String(center);
     }
-    bpmTargetVal.textContent = String(parseInt(bpmSlider.value,10));
-    // only adjust playbackRate when we have a detected source BPM; avoid changing speed before analysis
+    // Effective target BPM = detected * (slider/center) when detection exists, otherwise show slider value
+    const sliderVal = parseFloat(bpmSlider.value);
+    const effectiveTarget = detected ? Math.round(detected * (sliderVal / center)) : Math.round(sliderVal);
+    bpmTargetVal.textContent = String(effectiveTarget);
+    // Apply playback rate:
+    // - If we have a detected BPM and the user hasn't changed slider -> keep native speed (1.0)
+    // - Otherwise, the slider modifies speed relative to center: multiplier = sliderVal / center
     if(detected){
-      const target = parseInt(bpmSlider.value,10);
-      const src = detected;
-      const multiplier = src>0? (target / src) : 1.0;
-      deck.setPlaybackRate(multiplier);
+      if(!bpmUserChanged){
+        deck.setPlaybackRate(1.0);
+      }else{
+        const multiplier = sliderVal / center;
+        deck.setPlaybackRate(multiplier);
+      }
+    }else{
+      if(bpmUserChanged){
+        const multiplier = sliderVal / center;
+        deck.setPlaybackRate(multiplier);
+      }
     }
   }
 
   // react to slider changes per-deck
-  bpmSlider.addEventListener('input', ()=>{ bpmUserChanged = true; bpmTargetVal.textContent = String(parseInt(bpmSlider.value,10)); refreshBpmUI(); });
+  bpmSlider.addEventListener('input', ()=>{ bpmUserChanged = true; refreshBpmUI();
+    // update platter RPM directly from slider so rotation follows slider immediately
+  const sliderVal = parseFloat(bpmSlider.value) || ((parseInt(bpmSlider.min,10) + parseInt(bpmSlider.max,10))/2);
+  // apply 50% scaling so slider reflects half-speed rotation
+  platterComp.setRpm(sliderVal * 0.5);
+  });
 
   // when analysis is set from analyzeAndCache it will populate deck.analysis; hook into that by wrapping deck.onUpdate setter is already used — call refresh periodically when loaded
   const origOnUpdate = deck.onUpdate;

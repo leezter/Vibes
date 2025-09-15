@@ -9,6 +9,9 @@ export default class Platter {
     this.spinning = !!opts.spinning;
     this.labelText = opts.labelText || '';
     this.imageUrl = opts.imageUrl || null;
+    this._angle = 0; // degrees
+    this._rafId = null;
+    this._lastTs = null;
 
     this._createDOM();
     this.setSize(this.size);
@@ -93,14 +96,34 @@ export default class Platter {
   }
 
   _updateRotation(){
-    const dur = this._rotationDurationSeconds();
-    if(this.spinning && dur > 0){
-      this.platter.style.animationDuration = dur + 's';
-      this.platter.classList.add('spinning');
+    // stop any existing CSS animation usage
+    this.platter.style.animationDuration = '';
+    if(this.spinning && this.rpm > 0){
+      this._startRaf();
     }else{
-      this.platter.style.animationDuration = '';
-      this.platter.classList.remove('spinning');
+      this._stopRaf();
     }
+  }
+
+  _startRaf(){
+    if(this._rafId) return;
+    this._lastTs = performance.now();
+    const tick = (ts)=>{
+      const dt = (ts - this._lastTs) / 1000; // seconds
+      this._lastTs = ts;
+      // rpm -> degrees per second = rpm * 360 / 60 = rpm * 6
+      const degPerSec = (this.rpm || 0) * 6;
+      this._angle = (this._angle + degPerSec * dt) % 360;
+      // apply rotation
+      if(this.platter) this.platter.style.transform = `rotate(${this._angle}deg)`;
+      this._rafId = requestAnimationFrame(tick);
+    };
+    this._rafId = requestAnimationFrame(tick);
+  }
+
+  _stopRaf(){
+    if(this._rafId){ cancelAnimationFrame(this._rafId); this._rafId = null; }
+    this._lastTs = null;
   }
 
   // attach an element (e.g. waveform canvas) into the overlay

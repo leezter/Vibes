@@ -30,9 +30,8 @@ html,body,#app{height:100%;margin:0;font-family:Inter,system-ui,Segoe UI,Arial;b
 .platter-spindle{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:14px;height:14px;background:radial-gradient(circle,#cfcfcf,#8b8b8b);border-radius:50%;z-index:7;box-shadow:inset 0 1px 0 rgba(255,255,255,0.5)}
 .platter-overlay{position:absolute;inset:0;pointer-events:none}
 
-/* spin animation */
-.platter.spinning{animation-name:platter-spin;animation-iteration-count:infinite;animation-timing-function:linear}
-@keyframes platter-spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+/* rotation is now handled by JS (requestAnimationFrame) to avoid animation glitches */
+.platter{transform-origin:center center}
 
 /* decorative tonearm */
 .platter-tonearm{position:absolute;right:-10%;top:8%;width:46%;height:10px;transform-origin:8% 50%;pointer-events:none;z-index:9}
