@@ -1,0 +1,10 @@
+{
+  "name":"vibes-dj",
+  "version":"0.1.0",
+  "description":"Offline browser DJ app",
+  "scripts":{
+    "dev":"npx http-server -c-1 -p 5173 .",
+    "start":"npx http-server -c-1 -p 5173 ."
+  },
+  "license":"MIT"
+}

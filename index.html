@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Vibes — Offline DJ</title>
+  <link rel="manifest" href="/manifest.json">
+  <link rel="stylesheet" href="/styles/app.css">
+</head>
+<body>
+  <div id="app" class="app">
+    <header class="topbar">
+      <div class="left-status">Vibes — Local DJ</div>
+      <div class="center-status">Time: <span id="time">00:00</span></div>
+      <div class="right-status">Offline ready</div>
+    </header>
+
+    <main class="deck-row">
+      <section id="deckA" class="deck deck-left" aria-label="Deck A"></section>
+      <section class="mixer" id="mixer" aria-label="Mixer"></section>
+      <section id="deckB" class="deck deck-right" aria-label="Deck B"></section>
+    </main>
+
+    <aside class="browser" id="browser" aria-label="Browser">
+      <div class="library">
+        <div class="library-controls">
+          <button id="selectFolder">Select Folder</button>
+          <input id="folderPicker" type="file" webkitdirectory multiple hidden />
+          <input id="filePicker" type="file" accept="audio/*" multiple hidden />
+          <input id="search" placeholder="Search tracks..." />
+        </div>
+        <div id="trackList" class="track-list" role="list"></div>
+      </div>
+      <div class="track-info" id="trackInfo">
+        <div class="artwork" id="artwork"></div>
+        <div class="meta" id="meta"></div>
+      </div>
+    </aside>
+
+    <script type="module" src="/src/main.js"></script>
+  </div>
+</body>
+</html>
