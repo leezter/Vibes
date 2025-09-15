@@ -57,6 +57,81 @@ export function createDeckUI(container, engine, id){
     }
   });
 
+  // Pointer-based scratching on platter
+  // We expect platterComp.el to be a square element; interpret pointer movement as rotation around center
+  let isScratching = false;
+  let lastAngle = 0;
+  let lastTs = 0;
+  let lastScratchPos = null;
+  const getAngle = (clientX, clientY)=>{
+    const r = platterWrap.getBoundingClientRect();
+    const cx = r.left + r.width/2; const cy = r.top + r.height/2;
+    const dx = clientX - cx; const dy = clientY - cy;
+    const ang = Math.atan2(dy, dx) * 180 / Math.PI; // degrees
+    return ang;
+  };
+
+  const onPointerDown = (e)=>{
+    e.preventDefault(); platterWrap.setPointerCapture && platterWrap.setPointerCapture(e.pointerId);
+    isScratching = true; lastTs = performance.now(); lastAngle = getAngle(e.clientX, e.clientY);
+    // if deck is playing, pause the regular BufferSource so only the scratch node produces audio
+    const wasPlaying = !!deck.playing;
+    if(wasPlaying){
+      deck.pause();
+    }
+    // stop automatic platter spinning so pointer controls visual
+    platterComp.setSpinning(false);
+    // initialize scratch node and notify Deck to start scratch from current position
+  const pos = deck.getPosition();
+  lastScratchPos = pos;
+  deck.scratchStart(pos, 0.0);
+    // store flag to resume when pointer up
+    platterWrap._wasPlayingBeforeScratch = wasPlaying;
+  };
+  const onPointerMove = (e)=>{
+    if(!isScratching) return;
+    const now = performance.now(); const ang = getAngle(e.clientX, e.clientY);
+    const dt = Math.max(1, now - lastTs) / 1000; // s
+    // compute delta angle in degrees, normalize to -180..180
+    let dAng = ang - lastAngle; while(dAng > 180) dAng -= 360; while(dAng < -180) dAng += 360;
+    // angular velocity (deg/sec)
+    const vel = dAng / dt;
+    // map angular velocity to playbackRate multiplier relative to native speed
+    // small tuning: 360 deg/sec -> 2x speed, -360 deg/sec -> -2x (reverse)
+    const rate = Math.max(-4, Math.min(4, vel / 360 * 2));
+    // update deck scratch playback rate and position
+  // base position is the last scratch-updated position (or paused head)
+  const basePos = (typeof lastScratchPos === 'number') ? lastScratchPos : deck.getPosition();
+  deck.scratchSetRate(rate);
+  // advance/set internal position by a small amount proportional to rotation
+  // convert dAng to seconds: assume 360deg corresponds to 1 second of audio movement at 1x for a coarse mapping
+  const dtSeconds = (dAng / 360) * 1;
+  const newPos = Math.max(0, Math.min((deck.buffer?deck.buffer.duration:0), basePos + dtSeconds));
+  lastScratchPos = newPos;
+  deck.scratchSetPosition(newPos);
+    // update platter visual angle immediately for instant feedback
+    try{ platterComp.platter.style.transform = `rotate(${ang}deg)`; }catch(e){}
+    lastAngle = ang; lastTs = now;
+  };
+  const onPointerUp = (e)=>{
+    if(!isScratching) return; isScratching=false; try{ platterWrap.releasePointerCapture && platterWrap.releasePointerCapture(e.pointerId); }catch(e){}
+    // stop scratch audio
+    deck.scratchStop();
+    // if deck was playing before scratch, resume normal BufferSource playback at the new position
+    const finalPos = (typeof lastScratchPos === 'number') ? lastScratchPos : deck.getPosition();
+    if(platterWrap._wasPlayingBeforeScratch){
+      // resume at the last position reported by scratch
+      deck.resumeAtPosition(finalPos);
+    }
+    // restore platter spin driven by slider/deck state
+    updatePlatterFromDeck();
+    platterWrap._wasPlayingBeforeScratch = false;
+    lastScratchPos = null;
+  };
+  platterWrap.addEventListener('pointerdown', onPointerDown);
+  platterWrap.addEventListener('pointermove', onPointerMove);
+  window.addEventListener('pointerup', onPointerUp);
+
   // track whether the user manually changed the BPM slider
   let bpmUserChanged = false;
 

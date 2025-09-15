@@ -64,12 +64,17 @@ export class Deck {
     this._playStartContextTime = null;
     // and the track-offset (seconds) corresponding to that context time
     this._playStartTrackOffset = 0;
+    // scratch node (AudioWorklet) and control port
+    this.scratchNode = null;
+    this._scratchPort = null;
   }
 
   async loadFile(file){
     const arrayBuffer = await file.arrayBuffer();
     this.fileMeta = {name:file.name,size:file.size,lastModified:file.lastModified};
     this.buffer = await this.ctx.decodeAudioData(arrayBuffer.slice(0));
+  // when a buffer is loaded, prepare scratch node if audioWorklet available
+  try{ this._ensureScratchNode(); }catch(e){ console.debug('[Deck] scratch node setup failed', e && e.message); }
     this.pausedAt = 0;
     this.playing = false;
     // notify UI to draw waveform via analysis worker externally
@@ -101,6 +106,32 @@ export class Deck {
     this.source = s;
     return s;
   }
+
+  _ensureScratchNode(){
+    if(this.scratchNode) return;
+    if(!this.ctx || !this.ctx.audioWorklet) return;
+    try{
+      // create a node with up to 2 outputs (stereo)
+      const node = new AudioWorkletNode(this.ctx, 'scratch-processor', {numberOfOutputs:1, outputChannelCount:[2]});
+      // connect node to deck's processing chain (before EQ/gain) by connecting node -> eqLow
+      node.connect(this.eqLow);
+      this.scratchNode = node;
+      this._scratchPort = node.port;
+      // if buffer already decoded, send channels
+      if(this.buffer){
+        const ch0 = this.buffer.getChannelData(0).slice(0);
+        const ch1 = (this.buffer.numberOfChannels>1) ? this.buffer.getChannelData(1).slice(0) : ch0.slice(0);
+        // transferable arrays
+        this._scratchPort.postMessage({cmd:'setBuffer', channels:[ch0,ch1], sampleRate:this.buffer.sampleRate}, [ch0.buffer, ch1.buffer]);
+      }
+    }catch(e){ console.warn('[Deck] failed to create scratch node', e); }
+  }
+
+  // API for UI to control scratch
+  scratchStart(positionSeconds, playbackRate){ if(this._scratchPort) this._scratchPort.postMessage({cmd:'startScratch', position: positionSeconds, playbackRate}); }
+  scratchSetPosition(positionSeconds){ if(this._scratchPort) this._scratchPort.postMessage({cmd:'setPosition', position: positionSeconds}); }
+  scratchSetRate(playbackRate){ if(this._scratchPort) this._scratchPort.postMessage({cmd:'setRate', playbackRate}); }
+  scratchStop(){ if(this._scratchPort) this._scratchPort.postMessage({cmd:'stopScratch'}); }
 
   play(){
     const nowMs = Date.now();
@@ -139,6 +170,26 @@ export class Deck {
       // release lock shortly after to allow subsequent actions; keep small guard window
       setTimeout(()=>{ this._opLock = false; }, 8);
     }
+  }
+
+  // helper to start playback at a given position (seconds) - used to resume after scratch
+  resumeAtPosition(seconds){
+    // Directly create and start a fresh BufferSource at `seconds`.
+    if(!this.buffer) return;
+    try{
+      // stop any existing source
+      if(this.source){ try{ this.source.onended = null; this.source.stop(); }catch(e){} this.source = null; }
+      const startPos = Math.max(0, Math.min(seconds, this.buffer.duration));
+      this.pausedAt = startPos;
+      // create a new source and start immediately
+      const s = this._makeSource();
+      if(!s) return;
+      this._playStartTrackOffset = startPos;
+      this._playStartContextTime = this.ctx.currentTime;
+      this.startTime = this._playStartContextTime;
+      try{ s.start(0, startPos); this.playing = true; this.onUpdate({type:'play',deck:this.id}); }
+      catch(e){ console.error('[Deck] resumeAtPosition start failed', e); this.playing = false; }
+    }catch(e){ console.error('[Deck] resumeAtPosition error', e); }
   }
 
   pause(){

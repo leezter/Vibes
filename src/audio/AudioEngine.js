@@ -28,7 +28,12 @@ export class AudioEngine {
   async _maybeRegisterWorklet(){
     try{
       if(this.ctx && this.ctx.audioWorklet){
-        await this.ctx.audioWorklet.addModule('/src/audio/Worklets/Timeworklet.js');
+        // register core worklets; tolerance for failures per-module
+        const modules = ['/src/audio/Worklets/Timeworklet.js','/src/audio/Worklets/ScratchProcessor.js'];
+        for(const m of modules){
+          try{ await this.ctx.audioWorklet.addModule(m); }
+          catch(e){ console.warn('failed to register worklet', m, e); }
+        }
       }
     }catch(e){
       console.warn('AudioWorklet not available',e);
