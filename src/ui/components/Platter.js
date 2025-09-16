@@ -134,6 +134,15 @@ export default class Platter {
     this.overlay.appendChild(node);
   }
 
+  // get current platter angle in degrees (0-360)
+  getAngle(){ return this._angle || 0; }
+
+  // set platter angle (degrees) and update visual immediately
+  setAngle(deg){
+    this._angle = ((deg % 360) + 360) % 360;
+    if(this.platter) this.platter.style.transform = `rotate(${this._angle}deg)`;
+  }
+
   setImage(url){
     this.imageUrl = url || null;
     if(!this.platter) return;
