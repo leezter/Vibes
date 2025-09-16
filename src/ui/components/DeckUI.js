@@ -121,13 +121,15 @@ export function createDeckUI(container, engine, id){
   };
   const onPointerUp = (e)=>{
     if(!isScratching) return; isScratching=false; try{ platterWrap.releasePointerCapture && platterWrap.releasePointerCapture(e.pointerId); }catch(e){}
-    // stop scratch audio
-    deck.scratchStop();
     // if deck was playing before scratch, resume normal BufferSource playback at the new position
     const finalPos = (typeof lastScratchPos === 'number') ? lastScratchPos : deck.getPosition();
     if(platterWrap._wasPlayingBeforeScratch){
       // resume at the last position reported by scratch
       deck.resumeAtPosition(finalPos);
+    }
+    else {
+      // if we weren't playing before scratch, explicitly stop scratch output
+      deck.scratchStop();
     }
     // restore platter spin driven by slider/deck state
     updatePlatterFromDeck();

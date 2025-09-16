@@ -42,7 +42,12 @@ export class Deck {
     this.eqHigh.connect(this.filter);
     this.filter.connect(this.gain);
 
-    engine.connectDeck(this.gain);
+  // per-deck scratch gain (worklet output -> eqLow via scratchGain)
+  this.scratchGain = this.ctx.createGain();
+  this.scratchGain.gain.value = 0; // start silent until scratch active
+  // we will connect scratchGain to eqLow in _ensureScratchNode when node created
+
+  engine.connectDeck(this.gain);
 
     // UI hooks
     this.onUpdate = ()=>{};
@@ -91,7 +96,17 @@ export class Deck {
     const s = this.ctx.createBufferSource();
     s.buffer = this.buffer;
     s.playbackRate.value = this.playbackRate;
-    s.connect(this.eqLow);
+    // route source through a per-source gain so we can crossfade when resuming from scratch
+    try{
+      const sg = this.ctx.createGain(); sg.gain.value = 1.0;
+      s.connect(sg);
+      sg.connect(this.eqLow);
+      this.sourceGain = sg;
+    }catch(e){
+      // fallback: connect directly
+      s.connect(this.eqLow);
+      this.sourceGain = null;
+    }
     s.onended = ()=>{ // only act if this source is still the active one
       if(this.source === s){
         this.playing = false;
@@ -113,8 +128,9 @@ export class Deck {
     try{
       // create a node with up to 2 outputs (stereo)
       const node = new AudioWorkletNode(this.ctx, 'scratch-processor', {numberOfOutputs:1, outputChannelCount:[2]});
-      // connect node to deck's processing chain (before EQ/gain) by connecting node -> eqLow
-      node.connect(this.eqLow);
+      // connect node to deck's processing chain via scratchGain -> eqLow
+      node.connect(this.scratchGain);
+      this.scratchGain.connect(this.eqLow);
       this.scratchNode = node;
       this._scratchPort = node.port;
       // if buffer already decoded, send channels
@@ -128,10 +144,23 @@ export class Deck {
   }
 
   // API for UI to control scratch
-  scratchStart(positionSeconds, playbackRate){ if(this._scratchPort) this._scratchPort.postMessage({cmd:'startScratch', position: positionSeconds, playbackRate}); }
+  scratchStart(positionSeconds, playbackRate){
+    if(this._scratchPort) this._scratchPort.postMessage({cmd:'startScratch', position: positionSeconds, playbackRate});
+    // ensure scratch output is audible immediately
+    try{ if(this.scratchGain) this.scratchGain.gain.cancelScheduledValues(this.ctx.currentTime); this.scratchGain.gain.setValueAtTime(1.0, this.ctx.currentTime); }catch(e){}
+  }
   scratchSetPosition(positionSeconds){ if(this._scratchPort) this._scratchPort.postMessage({cmd:'setPosition', position: positionSeconds}); }
   scratchSetRate(playbackRate){ if(this._scratchPort) this._scratchPort.postMessage({cmd:'setRate', playbackRate}); }
-  scratchStop(){ if(this._scratchPort) this._scratchPort.postMessage({cmd:'stopScratch'}); }
+  scratchStop(){
+    if(this._scratchPort) this._scratchPort.postMessage({cmd:'stopScratch'});
+    // fade scratch output down slightly to avoid clicks
+    try{
+      if(this.scratchGain){
+        const now = this.ctx.currentTime; this.scratchGain.gain.cancelScheduledValues(now); this.scratchGain.gain.setValueAtTime(this.scratchGain.gain.value, now);
+        this.scratchGain.gain.linearRampToValueAtTime(0.0, now + 0.02);
+      }
+    }catch(e){ }
+  }
 
   play(){
     const nowMs = Date.now();
@@ -177,18 +206,43 @@ export class Deck {
     // Directly create and start a fresh BufferSource at `seconds`.
     if(!this.buffer) return;
     try{
-      // stop any existing source
-      if(this.source){ try{ this.source.onended = null; this.source.stop(); }catch(e){} this.source = null; }
+      if(!this.buffer) return;
       const startPos = Math.max(0, Math.min(seconds, this.buffer.duration));
       this.pausedAt = startPos;
-      // create a new source and start immediately
+      // create a new source and ensure it routes through a sourceGain
       const s = this._makeSource();
       if(!s) return;
-      this._playStartTrackOffset = startPos;
-      this._playStartContextTime = this.ctx.currentTime;
-      this.startTime = this._playStartContextTime;
-      try{ s.start(0, startPos); this.playing = true; this.onUpdate({type:'play',deck:this.id}); }
-      catch(e){ console.error('[Deck] resumeAtPosition start failed', e); this.playing = false; }
+      const now = this.ctx.currentTime;
+      const CROSSFADE = 0.04; // seconds
+      // ensure sourceGain exists
+      if(this.sourceGain){
+        try{
+          this.sourceGain.gain.cancelScheduledValues(now);
+          this.sourceGain.gain.setValueAtTime(0.0, now);
+          this.sourceGain.gain.linearRampToValueAtTime(1.0, now + CROSSFADE);
+        }catch(e){ }
+      }
+      // schedule scratch gain fade down
+      if(this.scratchGain){
+        try{
+          this.scratchGain.gain.cancelScheduledValues(now);
+          // start from current value (if any)
+          const cur = this.scratchGain.gain.value || 1.0;
+          this.scratchGain.gain.setValueAtTime(cur, now);
+          this.scratchGain.gain.linearRampToValueAtTime(0.0, now + CROSSFADE);
+        }catch(e){}
+      }
+      // start the source immediately at requested position
+      try{
+        s.start(0, startPos);
+        this._playStartTrackOffset = startPos;
+        this._playStartContextTime = now;
+        this.startTime = now;
+        this.playing = true;
+        this.onUpdate({type:'play',deck:this.id});
+      }catch(e){ console.error('[Deck] resumeAtPosition start failed', e); this.playing = false; }
+      // after crossfade, ensure scratchGain is silent
+      try{ setTimeout(()=>{ try{ if(this.scratchGain) this.scratchGain.gain.setValueAtTime(0, this.ctx.currentTime); }catch(e){} }, Math.ceil(CROSSFADE*1000)+5); }catch(e){}
     }catch(e){ console.error('[Deck] resumeAtPosition error', e); }
   }
 
