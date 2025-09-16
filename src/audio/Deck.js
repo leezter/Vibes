@@ -214,35 +214,37 @@ export class Deck {
       if(!s) return;
       const now = this.ctx.currentTime;
       const CROSSFADE = 0.04; // seconds
-      // ensure sourceGain exists
-      if(this.sourceGain){
-        try{
-          this.sourceGain.gain.cancelScheduledValues(now);
-          this.sourceGain.gain.setValueAtTime(0.0, now);
-          this.sourceGain.gain.linearRampToValueAtTime(1.0, now + CROSSFADE);
-        }catch(e){ }
-      }
-      // schedule scratch gain fade down
-      if(this.scratchGain){
-        try{
-          this.scratchGain.gain.cancelScheduledValues(now);
-          // start from current value (if any)
-          const cur = this.scratchGain.gain.value || 1.0;
-          this.scratchGain.gain.setValueAtTime(cur, now);
-          this.scratchGain.gain.linearRampToValueAtTime(0.0, now + CROSSFADE);
-        }catch(e){}
-      }
-      // start the source immediately at requested position
+      const PRELOAD_LEAD = 0.016; // schedule source slightly ahead (16ms) so engine can schedule it accurately
+      // ensure sourceGain exists and start the source slightly in the future to give audio thread lead time
+      const startTime = Math.max(now + PRELOAD_LEAD, now + 0.001);
       try{
-        s.start(0, startPos);
+        // prepare sourceGain fade: start silent at startTime - small epsilon, then ramp to 1 over CROSSFADE
+        if(this.sourceGain){
+          this.sourceGain.gain.cancelScheduledValues(startTime - 0.002);
+          this.sourceGain.gain.setValueAtTime(0.0, startTime - 0.002);
+          this.sourceGain.gain.linearRampToValueAtTime(1.0, startTime + CROSSFADE);
+        }
+      }catch(e){}
+      // schedule scratch gain fade down starting at startTime
+      try{
+        if(this.scratchGain){
+          this.scratchGain.gain.cancelScheduledValues(startTime - 0.002);
+          const cur = this.scratchGain.gain.value || 1.0;
+          this.scratchGain.gain.setValueAtTime(cur, startTime - 0.002);
+          this.scratchGain.gain.linearRampToValueAtTime(0.0, startTime + CROSSFADE);
+        }
+      }catch(e){}
+      // start the source at scheduled startTime at requested position
+      try{
+        s.start(startTime, startPos);
         this._playStartTrackOffset = startPos;
-        this._playStartContextTime = now;
-        this.startTime = now;
+        this._playStartContextTime = startTime;
+        this.startTime = startTime;
         this.playing = true;
         this.onUpdate({type:'play',deck:this.id});
-      }catch(e){ console.error('[Deck] resumeAtPosition start failed', e); this.playing = false; }
-      // after crossfade, ensure scratchGain is silent
-      try{ setTimeout(()=>{ try{ if(this.scratchGain) this.scratchGain.gain.setValueAtTime(0, this.ctx.currentTime); }catch(e){} }, Math.ceil(CROSSFADE*1000)+5); }catch(e){}
+      }catch(e){ console.error('[Deck] resumeAtPosition scheduled start failed', e); this.playing = false; }
+      // as a final safety, ensure scratchGain is silent after the crossfade completes
+      try{ setTimeout(()=>{ try{ if(this.scratchGain) this.scratchGain.gain.setValueAtTime(0, this.ctx.currentTime); }catch(e){} }, Math.ceil((PRELOAD_LEAD + CROSSFADE)*1000)+10); }catch(e){}
     }catch(e){ console.error('[Deck] resumeAtPosition error', e); }
   }
 
