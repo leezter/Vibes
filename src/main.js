@@ -63,7 +63,7 @@ window.addEventListener('load', async ()=>{
     }
   });
 
-  // --- temporary debugging knobs for PRELOAD_LEAD and CROSSFADE (ms) ---
+  // --- temporary debugging knobs for PRELOAD_LEAD, CROSSFADE (ms), and FLING params ---
   (function addTimingKnobs(){
     const knobsWrap = document.createElement('div');
     knobsWrap.style.position = 'fixed';
@@ -85,11 +85,45 @@ window.addEventListener('load', async ()=>{
       row.appendChild(label); row.appendChild(input); return row;
     }
 
+    function makeFlingKnob(labelText, initialVal, min, max, step, onChange){
+      const row = document.createElement('div'); row.style.marginBottom='8px';
+      const label = document.createElement('div'); label.textContent = labelText + ': ' + initialVal.toFixed(2); label.style.marginBottom='4px';
+      const input = document.createElement('input'); input.type='range'; input.min=String(min); input.max=String(max); input.step=String(step); input.value=String(initialVal); input.style.width='180px';
+      input.addEventListener('input', (ev)=>{ const v = Number(ev.target.value); label.textContent = labelText + ': ' + v.toFixed(2); onChange(v); });
+      row.appendChild(label); row.appendChild(input); return row;
+    }
+
     const initialPreMs = ((decks.A && decks.A.PRELOAD_LEAD)? decks.A.PRELOAD_LEAD*1000 : 16);
     const initialXfadeMs = ((decks.A && decks.A.CROSSFADE)? decks.A.CROSSFADE*1000 : 40);
     const preloadKnob = makeKnob('Preload lead', initialPreMs, (ms)=>{ const s = ms/1000; if(decks.A) decks.A.setPreloadLead(s); if(decks.B) decks.B.setPreloadLead(s); });
     const xfadeKnob = makeKnob('Crossfade', initialXfadeMs, (ms)=>{ const s = ms/1000; if(decks.A) decks.A.setCrossfade(s); if(decks.B) decks.B.setCrossfade(s); });
-    knobsWrap.appendChild(preloadKnob); knobsWrap.appendChild(xfadeKnob); document.body.appendChild(knobsWrap);
+
+  // Fling knobs (read/write window.VibesDebugFling consumed by DeckUI)
+    const fling = (window.VibesDebugFling = window.VibesDebugFling || { minRate: 0.18, minDegPerSec: 65, tau: 0.45, speedMult: 2.0 });
+    const minRateKnob = makeFlingKnob('Fling min rate (x)', fling.minRate, 0.05, 0.6, 0.01, (v)=>{ fling.minRate = v; });
+    const minDegKnob = makeFlingKnob('Fling min deg/sec', fling.minDegPerSec, 10, 180, 1, (v)=>{ fling.minDegPerSec = v; });
+    const tauKnob = makeFlingKnob('Fling tau (s)', fling.tau, 0.10, 1.50, 0.01, (v)=>{ fling.tau = v; });
+    const speedMultKnob = makeFlingKnob('Fling speed multiplier', fling.speedMult, 1.0, 6.0, 0.1, (v)=>{ fling.speedMult = v; });
+
+  // Scratch sensitivity knobs
+  const scratch = (window.VibesScratchCfg = window.VibesScratchCfg || { sensitivity: 1.0, maxRateBase: 4.0 });
+  const sensKnob = makeFlingKnob('Scratch sensitivity', scratch.sensitivity, 0.5, 10.0, 0.1, (v)=>{ scratch.sensitivity = v; });
+  const maxRateKnob = makeFlingKnob('Scratch max rate base', scratch.maxRateBase, 1.0, 20.0, 0.5, (v)=>{ scratch.maxRateBase = v; });
+
+    // Fling acceleration (visual) after fling end
+    const accel = (window.VibesFlingAccel = window.VibesFlingAccel || { duration: 0.5 });
+    const accelDurKnob = makeFlingKnob('Accel after fling (s)', accel.duration, 0.1, 1.5, 0.05, (v)=>{ accel.duration = v; });
+
+    knobsWrap.appendChild(preloadKnob);
+    knobsWrap.appendChild(xfadeKnob);
+    knobsWrap.appendChild(minRateKnob);
+    knobsWrap.appendChild(minDegKnob);
+    knobsWrap.appendChild(tauKnob);
+    knobsWrap.appendChild(speedMultKnob);
+    knobsWrap.appendChild(sensKnob);
+    knobsWrap.appendChild(maxRateKnob);
+    knobsWrap.appendChild(accelDurKnob);
+  document.body.appendChild(knobsWrap);
   })();
   // --- end knobs ---
 });

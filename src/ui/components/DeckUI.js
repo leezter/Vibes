@@ -66,10 +66,81 @@ export function createDeckUI(container, engine, id){
   let initialPlatterAngle = 0;
   let pointerStartAngle = 0;
   let pointerStartRadius = 0;
+  let lastVelDegPerSec = 0; // for fling
+  let lastSmoothedRate = 0; // for fling
+  let lastNonZeroRate = 0;  // last non-zero smoothed rate seen during move
+  let lastNonZeroTime = 0;  // timestamp when lastNonZeroRate was captured
   // UI-side smoothing for playbackRate to avoid zipper noise when sending frequent updates
   let uiLastRate = 1.0;
   let lastSentMs = 0;
   let lastMoveTs = 0;
+  // hold state with hysteresis to prevent chattering around the deadzone
+  let inHold = false;
+  // Debug-configurable fling parameters accessible from main.js knobs
+  const FlingCfg = (window.VibesDebugFling = window.VibesDebugFling || {
+    minRate: 0.18,       // minimum |rate| to trigger fling
+    minDegPerSec: 65,    // fallback threshold if rate is derived from deg/sec
+    tau: 0.45,           // decay time constant in seconds
+    speedMult: 2.0       // fling speed multiplier (applied to computed rate)
+  });
+  // Debug-configurable scratch sensitivity (how many track seconds per platter rotation)
+  const ScratchCfg = (window.VibesScratchCfg = window.VibesScratchCfg || {
+    sensitivity: 1.0,    // 1.0 = 1 rotation == 1 second; raise to go faster (e.g., 5.0)
+    maxRateBase: 4.0     // base clamp for |rate|; effective clamp = maxRateBase * sensitivity
+  });
+
+  // Fling visual animation state (platter rotation during fling)
+  let flingRAF = null;
+  let flingOmega = 0; // deg/sec
+  let flingTau = 0.45;
+  let flingLastTs = 0;
+  function startFlingVisual(rate, tau){
+    stopFlingVisual();
+    // Drive platter by integrating an exponentially decaying angular velocity
+    flingOmega = (rate || 0) * 360; // rate 1.0 -> 360 deg/sec
+    flingTau = Math.max(0.05, tau || 0.45);
+    flingLastTs = performance.now();
+    // ensure platter isn't also spinning via internal RAF
+    platterComp.setSpinning(false);
+    const tick = (ts)=>{
+      const dt = (ts - flingLastTs) / 1000; flingLastTs = ts;
+      // integrate rotation at current omega
+      const angleDelta = flingOmega * dt;
+      try{ platterComp.setAngle(platterComp.getAngle() + angleDelta); }catch(_e){}
+      // exponential decay of omega
+      const decay = Math.exp(-dt / flingTau);
+      flingOmega *= decay;
+      if(Math.abs(flingOmega) < 2){ flingRAF = null; return; } // stop when very slow (<2 deg/sec)
+      flingRAF = requestAnimationFrame(tick);
+    };
+    flingRAF = requestAnimationFrame(tick);
+  }
+  function stopFlingVisual(){ if(flingRAF){ cancelAnimationFrame(flingRAF); flingRAF = null; } }
+
+  // Platter acceleration ramp after fling -> normal playback
+  let accelRAF = null; let accelLastTs = 0; let accelOmega = 0; let accelTargetOmega = 0; let accelDur = 0.5; let accelElapsed = 0;
+  function startPlatterAccelRamp(targetRpm, durationSec){
+    stopFlingVisual(); // ensure fling loop is stopped
+    stopPlatterAccelRamp();
+    accelDur = Math.max(0.05, durationSec || 0.5);
+    accelElapsed = 0; accelLastTs = performance.now();
+    // Start from zero speed by design: ramp from 0 to target over accelDur
+    accelOmega = 0; // deg/sec
+    accelTargetOmega = (targetRpm || 33.333) * 6;
+    platterComp.setSpinning(false);
+    const tick = (ts)=>{
+      const dt = (ts - accelLastTs) / 1000; accelLastTs = ts; accelElapsed += dt;
+      const t = Math.min(1, accelElapsed / accelDur);
+      // smoothstep for a softer ease-in
+      const s = t*t*(3 - 2*t);
+      const omega = accelTargetOmega * s; // strictly 0 -> target, no overshoot
+      try{ platterComp.setAngle(platterComp.getAngle() + omega * dt); }catch(_e){}
+      if(t >= 1){ accelRAF = null; platterComp.setSpinning(true); platterComp.setRpm((accelTargetOmega/6)); return; }
+      accelRAF = requestAnimationFrame(tick);
+    };
+    accelRAF = requestAnimationFrame(tick);
+  }
+  function stopPlatterAccelRamp(){ if(accelRAF){ cancelAnimationFrame(accelRAF); accelRAF = null; } }
   const getAngle = (clientX, clientY)=>{
     const r = platterWrap.getBoundingClientRect();
     const cx = r.left + r.width/2; const cy = r.top + r.height/2;
@@ -100,6 +171,8 @@ export function createDeckUI(container, engine, id){
     lastScratchPos = pos;
   // start scratch with zero rate so a pure hold is silent and stops immediately
   deck.scratchStart(pos, 0.0);
+    // start in hold state until meaningful movement exits hold
+    inHold = true; try{ deck.scratchSetHold(true); deck.scratchSetRate(0); }catch(_e){}
     // reset UI smoothing state
     uiLastRate = 1.0;
     lastMoveTs = performance.now();
@@ -111,29 +184,42 @@ export function createDeckUI(container, engine, id){
   const now = performance.now(); const angObj = getAngle(e.clientX, e.clientY);
     const dt = Math.max(1, now - lastTs) / 1000; // s
     // if pointer moved into an inner deadzone near spindle, ignore to avoid unstable angles
-    const MIN_RADIUS = Math.min(platterWrap.clientWidth, platterWrap.clientHeight) * 0.08; // 8% of platter size
-    // If the pointer moved into the inner deadzone but the drag started outside, ignore to avoid unstable angles
-    if(angObj.dist < MIN_RADIUS && (pointerStartRadius || 0) >= MIN_RADIUS){
-      lastTs = now;
-      return;
-    }
+    const MIN_RADIUS = Math.min(platterWrap.clientWidth, platterWrap.clientHeight) * 0.06; // 6% of platter size (less aggressive)
     // compute delta angle in degrees (frame-to-frame), normalize to -180..180
   let dAng = angObj.ang - lastAngle; while(dAng > 180) dAng -= 360; while(dAng < -180) dAng += 360;
   // small deadzone to suppress tiny jitter (e.g., from radial movement or pointer noise)
-  const HOLD_DEADZONE_DEG = 0.5;
-  const isHoldThisFrame = Math.abs(dAng) < HOLD_DEADZONE_DEG;
-  if(isHoldThisFrame) dAng = 0;
+    // Deadzone with hysteresis: smaller threshold to enter hold, larger to exit
+  const HOLD_ENTER_DEG = 0.25;
+  const HOLD_EXIT_DEG = 0.5;
+    if(inHold){
+      if(Math.abs(dAng) > HOLD_EXIT_DEG) inHold = false;
+    } else {
+      if(Math.abs(dAng) < HOLD_ENTER_DEG) inHold = true;
+    }
+    const isHoldThisFrame = inHold;
+    if(isHoldThisFrame) dAng = 0;
     // angular velocity (deg/sec)
-    const vel = dAng / dt;
+  // If inside inner radius, scale down delta rather than dropping the frame entirely
+  let scaledDAng = dAng;
+  if(angObj.dist < MIN_RADIUS){
+    const scale = Math.max(0.15, angObj.dist / MIN_RADIUS); // keep some response
+    scaledDAng = dAng * scale;
+  }
+  const vel = scaledDAng / dt;
+  lastVelDegPerSec = vel;
   // compute rate; clamp to avoid extreme speeds, then lightly smooth
-  const rawRate = Math.max(-4, Math.min(4, vel / 360 * 1.0));
+  const sens = ScratchCfg.sensitivity || 1.0;
+  const maxRate = Math.max(1, (ScratchCfg.maxRateBase || 4) * sens);
+  const rawRate = Math.max(-maxRate, Math.min(maxRate, (vel / 360) * sens));
   let smoothedRate = uiLastRate * 0.3 + rawRate * 0.7; // emphasize responsiveness; worklet also smooths
   if(isHoldThisFrame){ smoothedRate = 0; }
   uiLastRate = smoothedRate;
+  lastSmoothedRate = smoothedRate;
+  if(!isHoldThisFrame && Math.abs(smoothedRate) > 0.02){ lastNonZeroRate = smoothedRate; lastNonZeroTime = now; }
     
     // compute new position by integrating angular delta into seconds
     const basePos = (typeof lastScratchPos === 'number') ? lastScratchPos : deck.getPosition();
-  const dtSeconds = (dAng / 360) * 1.0; // normal sensitivity
+  const dtSeconds = (scaledDAng / 360) * sens; // scaled sensitivity
   const newPos = isHoldThisFrame ? basePos : Math.max(0, Math.min((deck.buffer?deck.buffer.duration:0), basePos + dtSeconds));
     lastScratchPos = newPos;
     
@@ -142,7 +228,7 @@ export function createDeckUI(container, engine, id){
     
     // send rate updates at regular intervals; send position only occasionally to reduce zipper noise
     const nowMs = performance.now();
-    if(nowMs - lastSentMs >= 15){ // ~66Hz: more frequent zero asserts on holds
+    if(nowMs - lastSentMs >= 15){ // ~66Hz: frequent asserts
       // Drive hold flag into worklet for deterministic freeze, and push explicit rate
       deck.scratchSetHold(isHoldThisFrame);
       deck.scratchSetRate(isHoldThisFrame ? 0 : smoothedRate);
@@ -166,22 +252,72 @@ export function createDeckUI(container, engine, id){
   };
   const onPointerUp = (e)=>{
     if(!isScratching) return; isScratching=false; try{ platterWrap.releasePointerCapture && platterWrap.releasePointerCapture(e.pointerId); }catch(e){}
+    // Compute a fresh release velocity from the final pointer delta so we don't miss fling due to last frame being in hold
+    const now = performance.now();
+    const angObj = getAngle(e.clientX, e.clientY);
+    let dAngRelease = angObj.ang - lastAngle; while(dAngRelease > 180) dAngRelease -= 360; while(dAngRelease < -180) dAngRelease += 360;
+    const dtRelease = Math.max(0.001, (now - lastTs) / 1000);
+    const releaseVelDegPerSec = dAngRelease / dtRelease;
+    // update last-known velocity for logging/threshold
+    lastVelDegPerSec = releaseVelDegPerSec;
     // if deck was playing before scratch, resume normal BufferSource playback at the new position
     const finalPos = (typeof lastScratchPos === 'number') ? lastScratchPos : deck.getPosition();
-  // End hold; send a final zero-rate to guarantee worklet freeze
-  try{ deck.scratchSetHold(false); deck.scratchSetRate(0); }catch(_e){}
+    const FLING_MIN_RATE = FlingCfg.minRate; // ~0.18x (~65 deg/sec) by default
+    const FLING_MIN_DEG_PER_SEC = FlingCfg.minDegPerSec; // backup threshold if smoothedRate is zero
+    const FLING_RATE_SCALE = 1/360;   // deg/sec to rate multiplier
+  const sens = ScratchCfg.sensitivity || 1.0;
+  const derivedRate = (releaseVelDegPerSec * FLING_RATE_SCALE) * sens;
+    // Also consider the last non-zero rate seen within a short window before release
+    const sinceLastNZ = performance.now() - (lastNonZeroTime || now);
+    const decay = Math.exp(-sinceLastNZ / 120); // ~120ms memory
+    const candidate1 = (Math.abs(lastSmoothedRate) > 0.001) ? lastSmoothedRate : 0;
+    const candidate2 = derivedRate;
+    const candidate3 = (lastNonZeroRate && sinceLastNZ < 400) ? (lastNonZeroRate * decay) : 0;
+    let flingRate = candidate1;
+    if(Math.abs(candidate2) > Math.abs(flingRate)) flingRate = candidate2;
+    if(Math.abs(candidate3) > Math.abs(flingRate)) flingRate = candidate3;
+    const doFling = Math.abs(flingRate) >= FLING_MIN_RATE || Math.abs(releaseVelDegPerSec) >= FLING_MIN_DEG_PER_SEC;
+    console.debug('[DeckUI] release', id, {
+      lastSmoothedRate: +lastSmoothedRate.toFixed?.(3) ?? lastSmoothedRate,
+      lastNonZeroRate: +lastNonZeroRate.toFixed?.(3) ?? lastNonZeroRate,
+      sinceLastNZ: Math.round(sinceLastNZ),
+      releaseVelDegPerSec: Math.round(releaseVelDegPerSec),
+      derivedRate: +derivedRate.toFixed?.(3) ?? derivedRate,
+      flingRate: +flingRate.toFixed?.(3) ?? flingRate,
+      doFling
+    });
+    // End hold; if we will fling, don't send a zero-rate first—start fling immediately
+    try{ deck.scratchSetHold(false); }catch(_e){}
     if(platterWrap._wasPlayingBeforeScratch){
       // resume at the last position reported by scratch
-      deck.resumeAtPosition(finalPos);
+      if(doFling){
+        const boosted = flingRate * (FlingCfg.speedMult || 1.0);
+        console.debug('[DeckUI] fling start (playing before)', id, 'rate=', flingRate.toFixed(3), 'boosted=', boosted.toFixed(3));
+  // Pass accel duration for audio resume ramp so it matches the platter accel feel
+  deck.scratchFling(boosted, FlingCfg.tau, true, (window.VibesFlingAccel && window.VibesFlingAccel.duration) || 0.5, finalPos);
+        startFlingVisual(boosted, FlingCfg.tau);
+      } else {
+        try{ deck.scratchSetRate(0); }catch(_e){}
+        deck.resumeAtPosition(finalPos);
+      }
     }
     else {
       // if we weren't playing before scratch, explicitly stop scratch output
-      deck.scratchStop();
+      if(doFling){
+        const boosted = flingRate * (FlingCfg.speedMult || 1.0);
+        console.debug('[DeckUI] fling start (stopped before)', id, 'rate=', flingRate.toFixed(3), 'boosted=', boosted.toFixed(3));
+  deck.scratchFling(boosted, FlingCfg.tau, false, 0, finalPos);
+        startFlingVisual(boosted, FlingCfg.tau);
+      } else {
+        try{ deck.scratchSetRate(0); }catch(_e){}
+        deck.scratchStop();
+      }
     }
     // restore platter spin driven by slider/deck state
     updatePlatterFromDeck();
     platterWrap._wasPlayingBeforeScratch = false;
     lastScratchPos = null;
+    inHold = false;
   };
   platterWrap.addEventListener('pointerdown', onPointerDown);
   platterWrap.addEventListener('pointermove', onPointerMove);
@@ -290,14 +426,16 @@ export function createDeckUI(container, engine, id){
 
   // sync platter spinning and label to deck state
   const updatePlatterFromDeck = ()=>{
-    // spinning when deck is playing
-    platterComp.setSpinning(!!deck.playing);
+    // if fling or accel visual animation is active, don't override; otherwise reflect deck playing state
+    if(!flingRAF && !accelRAF){
+      platterComp.setSpinning(!!deck.playing);
+    }
     // label from track name if available
     if(deck && deck.file && deck.file.name) platterComp.setLabel(deck.file.name);
-    // RPM driven by slider position: center of the slider is default rpm; moving slider left/right adjusts spin speed
-  const sliderVal = parseFloat(bpmSlider.value) || ((parseInt(bpmSlider.min,10) + parseInt(bpmSlider.max,10))/2);
-  // apply 50% scaling to reduce perceived spin speed
-  platterComp.setRpm(sliderVal * 0.5);
+    // During normal playback (BufferSource), drive RPM from deck.playbackRate
+    // Base: 33.333 rpm scaled by current deck rate
+    const baseRpm = 33.333 * (deck.playbackRate || 1.0);
+    platterComp.setRpm(baseRpm);
   }
   // call once to initialize label/spin
   updatePlatterFromDeck();
@@ -340,16 +478,46 @@ export function createDeckUI(container, engine, id){
   }
 
   // react to slider changes per-deck
-  bpmSlider.addEventListener('input', ()=>{ bpmUserChanged = true; refreshBpmUI();
-    // update platter RPM directly from slider so rotation follows slider immediately
-  const sliderVal = parseFloat(bpmSlider.value) || ((parseInt(bpmSlider.min,10) + parseInt(bpmSlider.max,10))/2);
-  // apply 50% scaling so slider reflects half-speed rotation
-  platterComp.setRpm(sliderVal * 0.5);
-  });
+  bpmSlider.addEventListener('input', ()=>{ bpmUserChanged = true; refreshBpmUI(); updatePlatterFromDeck(); });
 
   // when analysis is set from analyzeAndCache it will populate deck.analysis; hook into that by wrapping deck.onUpdate setter is already used — call refresh periodically when loaded
   const origOnUpdate = deck.onUpdate;
-  deck.onUpdate = (msg)=>{ if(typeof origOnUpdate==='function') origOnUpdate(msg); if(msg.type==='loaded' || msg.type==='analysis'){ refreshBpmUI(); } }
+  deck.onUpdate = (msg)=>{
+    if(typeof origOnUpdate==='function') origOnUpdate(msg);
+    if(msg.type==='loaded' || msg.type==='analysis'){ refreshBpmUI(); }
+    if(msg.type==='flingStart'){
+      // reset overlap flag for this fling cycle
+      onUpdate._overlapAccelStarted = false;
+      startFlingVisual(msg.rate || 0, msg.tau || FlingCfg.tau);
+    }
+    if(msg.type==='flingOverlapStart'){
+      // Begin platter acceleration at the same time audio overlap starts, so visuals match
+      stopFlingVisual();
+      const accelCfg = (window.VibesFlingAccel || { duration: 0.5 });
+      const targetRpm = 33.333 * (deck.playbackRate || 1);
+      if(msg.direction === 'forward'){
+        // For forward flings, we don't want a visible accelerate-from-zero; just ensure platter is spinning
+        platterComp.setSpinning(true);
+        platterComp.setRpm(targetRpm);
+      }else{
+        startPlatterAccelRamp(targetRpm, accelCfg.duration || 0.5);
+      }
+      onUpdate._overlapAccelStarted = true;
+    }
+    if(msg.type==='flingEnd'){
+      stopFlingVisual();
+  // If we already started an overlap acceleration, do not trigger a second ramp on flingEnd
+  if(onUpdate._overlapAccelStarted){ onUpdate._overlapAccelStarted = false; return; }
+      // Otherwise, start a short acceleration of platter towards normal rpm
+      const accelCfg = (window.VibesFlingAccel || { duration: 0.5, startRate: 0.6 });
+      const targetRpm = 33.333 * (deck.playbackRate || 1);
+      startPlatterAccelRamp(targetRpm, accelCfg.duration || 0.5);
+    }
+    if(msg.type==='play' || msg.type==='pause'){
+      // ensure visual reflects play state; if fling still active, tick will continue until it stops
+      updatePlatterFromDeck();
+    }
+  }
 
   return deck;
 }

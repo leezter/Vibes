@@ -158,6 +158,39 @@ export class Deck {
       this.scratchGain.connect(this.eqLow);
       this.scratchNode = node;
       this._scratchPort = node.port;
+      // listen for fling end notifications
+      this._scratchPort.onmessage = (ev)=>{
+        const d = ev.data || {};
+        if(d.cmd === 'flingEnd'){
+          // When fling ends, keep the position as reported; if deck was previously playing, optionally resume source
+          try{
+            if(typeof d.positionSeconds === 'number') this.pausedAt = d.positionSeconds;
+          }catch(_e){}
+          try{ if(typeof this.onUpdate==='function') this.onUpdate({type:'flingEnd', deck:this.id, position:this.pausedAt}); }catch(_e){}
+          // Fade scratch down softly
+          try{
+            const now = this.ctx.currentTime; this.scratchGain.gain.cancelScheduledValues(now);
+            this.scratchGain.gain.setValueAtTime(this.scratchGain.gain.value, now);
+            this.scratchGain.gain.linearRampToValueAtTime(0.0, now + 0.04);
+          }catch(_e){}
+          // If asked to resume after fling and deck was playing before scratch, schedule a resume
+          try{
+            if(this._resumeAfterFling){
+              const pos = (typeof d.positionSeconds === 'number') ? d.positionSeconds : this.pausedAt;
+              // small delay to avoid overlap with scratch fade
+              setTimeout(()=>{
+                const accel = Math.max(0, Number(this._resumeAfterFlingAccelSec)||0);
+                if(accel > 0 && typeof this.resumeAtPositionWithAccel === 'function'){
+                  this.resumeAtPositionWithAccel(pos, accel);
+                }else{
+                  this.resumeAtPosition(pos);
+                }
+                this._resumeAfterFling = false; this._resumeAfterFlingAccelSec = 0;
+              }, 10);
+            }
+          }catch(_e){}
+        }
+      };
       console.debug('[Deck] scratch node created successfully');
       // if buffer already decoded, send channels
       if(this.buffer){
@@ -207,6 +240,87 @@ export class Deck {
         this.scratchGain.gain.linearRampToValueAtTime(0.0, now + 0.02);
       }
     }catch(e){ }
+  }
+
+  // Start a fling: coasting with initial rate and tau decay time constant (seconds)
+  // If resumeAfter is true and this deck was previously playing, resume BufferSource playback at fling end.
+  // Optional: resumeAccelSec (>0) ramps playbackRate from near 0 to current deck rate over the given seconds.
+  // Optional: resumeStartPos specifies the track position at the start of the fling (for accurate early resume alignment).
+  scratchFling(rate, tau=0.45, resumeAfter=false, resumeAccelSec=0, resumeStartPos=undefined){
+    if(!this._scratchPort) return;
+    this._resumeAfterFling = !!resumeAfter;
+    this._resumeAfterFlingAccelSec = Math.max(0, Number(resumeAccelSec)||0);
+    this._resumeScheduledEarly = false;
+    // store fling prediction data to allow early resume scheduling
+    this._flingPredict = {
+      startCtxTime: this.ctx.currentTime,
+      startPos: (typeof resumeStartPos === 'number') ? resumeStartPos : this.getPosition(),
+      rate0: Number(rate)||0,
+      tau: Math.max(0.01, Number(tau)||0.45)
+    };
+    console.debug('[Deck] scratchFling', this.id, 'rate:', rate, 'tau:', tau, 'resumeAfter:', this._resumeAfterFling);
+    try{ if(typeof this.onUpdate==='function') this.onUpdate({type:'flingStart', deck:this.id, rate, tau, position:this.getPosition()}); }catch(_e){}
+    try{
+      const now = this.ctx.currentTime; this.scratchGain.gain.cancelScheduledValues(now);
+      // ensure scratch audible for the fling duration
+      const cur = this.scratchGain.gain.value; this.scratchGain.gain.setValueAtTime(cur, now);
+      this.scratchGain.gain.linearRampToValueAtTime(1.0, now + 0.008);
+    }catch(_e){}
+    this._scratchPort.postMessage({cmd:'fling', rate, tau});
+
+    // schedule early resume (overlap)
+    try{
+      if(this._resumeAfterFling){
+        const r0 = Number(this._flingPredict.rate0)||0;
+        const tau = this._flingPredict.tau;
+        const startCtx = this._flingPredict.startCtxTime;
+        const pos0 = this._flingPredict.startPos;
+        // forward fling: crossfade to normal at the moment rate decays to 1.0x (no accel ramp)
+        if(r0 > 1.02){
+          const tCross = tau * Math.log(r0 / 1.0);
+          const startAtCtxTime = startCtx + Math.max(0, tCross);
+          const posAtStart = pos0 + (r0 * tau * (1 - Math.exp(-Math.max(0, tCross) / tau)));
+          const delayMs = Math.max(0, (startAtCtxTime - this.ctx.currentTime) * 1000);
+          setTimeout(()=>{
+            try{
+              if(!this.buffer) return;
+              if(!this._resumeAfterFling) return;
+              try{ if(typeof this.onUpdate==='function') this.onUpdate({type:'flingOverlapStart', deck:this.id, startAtCtxTime, overlapSec: (typeof this.CROSSFADE==='number'?this.CROSSFADE:0.04), accelSec: 0, direction:'forward'}); }catch(_e){}
+              if(typeof this.resumeAtPositionWithAccelAt === 'function'){
+                this.resumeAtPositionWithAccelAt(posAtStart, 0, startAtCtxTime, (typeof this.CROSSFADE==='number'?this.CROSSFADE:0.04));
+              }else{
+                this.resumeAtPosition(posAtStart);
+              }
+              this._resumeScheduledEarly = true; this._resumeAfterFling = false; this._resumeAfterFlingAccelSec = 0;
+            }catch(e){ console.debug('[Deck] early forward resume scheduling error', e && e.message); }
+          }, Math.round(delayMs));
+        }
+        // backward fling: begin accel ramp overlap shortly before fling would end, if accelSec > 0
+        else if(r0 < -0.001 && this._resumeAfterFlingAccelSec > 0){
+          const absR = Math.abs(r0);
+          const rateThresh = 0.02; // when |rate| falls below this, consider fling ended
+          const tEnd = tau * Math.max(0, Math.log(absR / rateThresh));
+          const overlap = 0.5; // seconds before end to begin acceleration
+          const tStart = Math.max(0, tEnd - overlap);
+          const startAtCtxTime = startCtx + tStart;
+          const posAtStart = pos0 + (r0 * tau * (1 - Math.exp(-tStart / tau)));
+          const delayMs = Math.max(0, (startAtCtxTime - this.ctx.currentTime) * 1000);
+          setTimeout(()=>{
+            try{
+              if(!this.buffer) return;
+              if(!this._resumeAfterFling) return;
+              try{ if(typeof this.onUpdate==='function') this.onUpdate({type:'flingOverlapStart', deck:this.id, startAtCtxTime, overlapSec: overlap, accelSec: this._resumeAfterFlingAccelSec, direction:'backward'}); }catch(_e){}
+              if(typeof this.resumeAtPositionWithAccelAt === 'function'){
+                this.resumeAtPositionWithAccelAt(posAtStart, this._resumeAfterFlingAccelSec, startAtCtxTime, overlap);
+              }else{
+                this.resumeAtPositionWithAccel(posAtStart, this._resumeAfterFlingAccelSec);
+              }
+              this._resumeScheduledEarly = true; this._resumeAfterFling = false; this._resumeAfterFlingAccelSec = 0;
+            }catch(e){ console.debug('[Deck] early backward resume scheduling error', e && e.message); }
+          }, Math.round(delayMs));
+        }
+      }
+    }catch(e){ /* ignore */ }
   }
 
   play(){
@@ -293,6 +407,109 @@ export class Deck {
       // as a final safety, ensure scratchGain is silent after the crossfade completes
       try{ setTimeout(()=>{ try{ if(this.scratchGain) this.scratchGain.gain.setValueAtTime(0, this.ctx.currentTime); }catch(e){} }, Math.ceil((PRELOAD_LEAD + CROSSFADE)*1000)+10); }catch(e){}
     }catch(e){ console.error('[Deck] resumeAtPosition error', e); }
+  }
+
+  // Resume at position with acceleration ramp on playbackRate over durationSec seconds.
+  // Starts with a very low playbackRate (~0.01) to avoid silence glitches, then ramps to this.playbackRate.
+  resumeAtPositionWithAccel(seconds, durationSec){
+    if(!this.buffer) return;
+    const accel = Math.max(0.01, Number(durationSec)||0);
+    try{
+      const startPos = Math.max(0, Math.min(seconds, this.buffer.duration));
+      this.pausedAt = startPos;
+      const s = this._makeSource();
+      if(!s) return;
+      const now = this.ctx.currentTime;
+      const CROSSFADE = (typeof this.CROSSFADE === 'number') ? this.CROSSFADE : 0.04;
+      const PRELOAD_LEAD = (typeof this.PRELOAD_LEAD === 'number') ? this.PRELOAD_LEAD : 0.016;
+      const startTime = Math.max(now + PRELOAD_LEAD, now + 0.001);
+      // PlaybackRate ramp: tiny start value -> target rate over accel seconds
+      try{
+        const targetRate = this.playbackRate || 1.0;
+        s.playbackRate.cancelScheduledValues(startTime - 0.002);
+        s.playbackRate.setValueAtTime(Math.max(0.01, targetRate * 0.02), startTime - 0.002);
+        if(accel > 0){
+          s.playbackRate.linearRampToValueAtTime(targetRate, startTime + accel);
+        }else{
+          s.playbackRate.setValueAtTime(targetRate, startTime);
+        }
+      }catch(e){}
+      // Crossfade from scratch to source
+      try{
+        if(this.sourceGain){
+          this.sourceGain.gain.cancelScheduledValues(startTime - 0.002);
+          this.sourceGain.gain.setValueAtTime(0.0, startTime - 0.002);
+          this.sourceGain.gain.linearRampToValueAtTime(1.0, startTime + CROSSFADE);
+        }
+      }catch(e){}
+      try{
+        if(this.scratchGain){
+          this.scratchGain.gain.cancelScheduledValues(startTime - 0.002);
+          const cur = this.scratchGain.gain.value || 1.0;
+          this.scratchGain.gain.setValueAtTime(cur, startTime - 0.002);
+          this.scratchGain.gain.linearRampToValueAtTime(0.0, startTime + CROSSFADE);
+        }
+      }catch(e){}
+      try{
+        s.start(startTime, startPos);
+        this._playStartTrackOffset = startPos;
+        this._playStartContextTime = startTime;
+        this.startTime = startTime;
+        this.playing = true;
+        this.onUpdate({type:'play',deck:this.id});
+      }catch(e){ console.error('[Deck] resumeAtPositionWithAccel start failed', e); this.playing = false; }
+      try{ setTimeout(()=>{ try{ if(this.scratchGain) this.scratchGain.gain.setValueAtTime(0, this.ctx.currentTime); }catch(e){} }, Math.ceil((PRELOAD_LEAD + CROSSFADE)*1000)+10); }catch(e){}
+    }catch(e){ console.error('[Deck] resumeAtPositionWithAccel error', e); }
+  }
+
+  // Schedule resume at a specific AudioContext time with accel and overlap fade of scratch.
+  // startAtCtxTime: absolute AudioContext time to start the source
+  // overlapSec: duration to ramp scratchGain from current value down to 0 starting at startAtCtxTime
+  resumeAtPositionWithAccelAt(seconds, durationSec, startAtCtxTime, overlapSec=0.5){
+    if(!this.buffer) return;
+    const accel = Math.max(0.01, Number(durationSec)||0);
+    try{
+      const startPos = Math.max(0, Math.min(seconds, this.buffer.duration));
+      this.pausedAt = startPos;
+      const s = this._makeSource(); if(!s) return;
+      const CROSSFADE = (typeof this.CROSSFADE === 'number') ? this.CROSSFADE : 0.04;
+      const startTime = Math.max(this.ctx.currentTime + 0.001, Number(startAtCtxTime)|| (this.ctx.currentTime + 0.016));
+      // playbackRate ramp
+      try{
+        const targetRate = this.playbackRate || 1.0;
+        s.playbackRate.cancelScheduledValues(startTime - 0.002);
+        s.playbackRate.setValueAtTime(Math.max(0.01, targetRate * 0.02), startTime - 0.002);
+        s.playbackRate.linearRampToValueAtTime(targetRate, startTime + accel);
+      }catch(e){}
+      // source gain fade-in (use CROSSFADE)
+      try{
+        if(this.sourceGain){
+          this.sourceGain.gain.cancelScheduledValues(startTime - 0.002);
+          this.sourceGain.gain.setValueAtTime(0.0, startTime - 0.002);
+          this.sourceGain.gain.linearRampToValueAtTime(1.0, startTime + CROSSFADE);
+        }
+      }catch(e){}
+      // scratch gain fade-out over overlapSec so fling tail overlaps with accel start
+      try{
+        const ov = Math.max(CROSSFADE, Number(overlapSec)||0.5);
+        if(this.scratchGain){
+          this.scratchGain.gain.cancelScheduledValues(startTime - 0.002);
+          const cur = this.scratchGain.gain.value || 1.0;
+          this.scratchGain.gain.setValueAtTime(cur, startTime - 0.002);
+          this.scratchGain.gain.linearRampToValueAtTime(0.0, startTime + ov);
+        }
+      }catch(e){}
+      // start
+      try{
+        s.start(startTime, startPos);
+        this._playStartTrackOffset = startPos;
+        this._playStartContextTime = startTime;
+        this.startTime = startTime;
+        this.playing = true;
+        this.onUpdate({type:'play',deck:this.id});
+      }catch(e){ console.error('[Deck] resumeAtPositionWithAccelAt start failed', e); this.playing = false; }
+      try{ setTimeout(()=>{ try{ if(this.scratchGain) this.scratchGain.gain.setValueAtTime(0, this.ctx.currentTime); }catch(e){} }, Math.ceil(((Number(overlapSec)||0.5))*1000)+20); }catch(e){}
+    }catch(e){ console.error('[Deck] resumeAtPositionWithAccelAt error', e); }
   }
 
   // runtime setters for knobs (temporary UI use)
