@@ -72,6 +72,24 @@ export class Deck {
     // scratch node (AudioWorklet) and control port
     this.scratchNode = null;
     this._scratchPort = null;
+    // timing knobs (defaults)
+    this.PRELOAD_LEAD = 0.016; // seconds
+    this.CROSSFADE = 0.04; // seconds
+  }
+
+  // Immediately stop audio output and set pausedAt to current position without debounce/op lock.
+  stopImmediate(){
+    try{
+      const pos = this.getPosition();
+      if(this.source){ try{ this.source.onended = null; this.source.stop(); }catch(e){} this.source = null; }
+      this.pausedAt = Math.max(0, Math.min(this.buffer?this.buffer.duration:Infinity, pos));
+      this.playing = false;
+      // clear bookkeeping
+      this._playStartContextTime = null;
+      this._playStartTrackOffset = 0;
+      this.startTime = 0;
+      if(typeof this.onUpdate === 'function') this.onUpdate({type:'pause', deck:this.id});
+    }catch(e){ console.warn('[Deck] stopImmediate error', e); }
   }
 
   async loadFile(file){
@@ -79,7 +97,10 @@ export class Deck {
     this.fileMeta = {name:file.name,size:file.size,lastModified:file.lastModified};
     this.buffer = await this.ctx.decodeAudioData(arrayBuffer.slice(0));
   // when a buffer is loaded, prepare scratch node if audioWorklet available
-  try{ this._ensureScratchNode(); }catch(e){ console.debug('[Deck] scratch node setup failed', e && e.message); }
+  // add small delay to ensure worklet registration is complete
+  setTimeout(() => {
+    try{ this._ensureScratchNode(); }catch(e){ console.debug('[Deck] scratch node setup failed', e && e.message); }
+  }, 100);
     this.pausedAt = 0;
     this.playing = false;
     // notify UI to draw waveform via analysis worker externally
@@ -124,8 +145,12 @@ export class Deck {
 
   _ensureScratchNode(){
     if(this.scratchNode) return;
-    if(!this.ctx || !this.ctx.audioWorklet) return;
+    if(!this.ctx || !this.ctx.audioWorklet) {
+      console.warn('[Deck] AudioWorklet not available for scratch node');
+      return;
+    }
     try{
+      console.debug('[Deck] creating scratch-processor node');
       // create a node with up to 2 outputs (stereo)
       const node = new AudioWorkletNode(this.ctx, 'scratch-processor', {numberOfOutputs:1, outputChannelCount:[2]});
       // connect node to deck's processing chain via scratchGain -> eqLow
@@ -133,24 +158,46 @@ export class Deck {
       this.scratchGain.connect(this.eqLow);
       this.scratchNode = node;
       this._scratchPort = node.port;
+      console.debug('[Deck] scratch node created successfully');
       // if buffer already decoded, send channels
       if(this.buffer){
         const ch0 = this.buffer.getChannelData(0).slice(0);
         const ch1 = (this.buffer.numberOfChannels>1) ? this.buffer.getChannelData(1).slice(0) : ch0.slice(0);
         // transferable arrays
         this._scratchPort.postMessage({cmd:'setBuffer', channels:[ch0,ch1], sampleRate:this.buffer.sampleRate}, [ch0.buffer, ch1.buffer]);
+        console.debug('[Deck] sent buffer to scratch processor');
       }
-    }catch(e){ console.warn('[Deck] failed to create scratch node', e); }
+    }catch(e){ 
+      console.warn('[Deck] failed to create scratch node', e); 
+      // retry once after a short delay in case worklet registration is still pending
+      if(!this._scratchRetried){
+        this._scratchRetried = true;
+        setTimeout(() => {
+          console.debug('[Deck] retrying scratch node creation');
+          this._ensureScratchNode();
+        }, 500);
+      }
+    }
   }
 
   // API for UI to control scratch
   scratchStart(positionSeconds, playbackRate){
+    console.debug('[Deck] scratchStart', this.id, 'pos:', positionSeconds, 'rate:', playbackRate);
     if(this._scratchPort) this._scratchPort.postMessage({cmd:'startScratch', position: positionSeconds, playbackRate});
-    // ensure scratch output is audible immediately
-    try{ if(this.scratchGain) this.scratchGain.gain.cancelScheduledValues(this.ctx.currentTime); this.scratchGain.gain.setValueAtTime(1.0, this.ctx.currentTime); }catch(e){}
+    // set scratch output audible with a tiny ramp to avoid clicks
+    try{
+      if(this.scratchGain){
+        const now = this.ctx.currentTime;
+        this.scratchGain.gain.cancelScheduledValues(now);
+        const cur = this.scratchGain.gain.value;
+        this.scratchGain.gain.setValueAtTime(cur, now);
+        this.scratchGain.gain.linearRampToValueAtTime(1.0, now + 0.008);
+      }
+    }catch(e){}
   }
   scratchSetPosition(positionSeconds){ if(this._scratchPort) this._scratchPort.postMessage({cmd:'setPosition', position: positionSeconds}); }
   scratchSetRate(playbackRate){ if(this._scratchPort) this._scratchPort.postMessage({cmd:'setRate', playbackRate}); }
+  scratchSetHold(holding){ if(this._scratchPort) this._scratchPort.postMessage({cmd:'setHold', holding: !!holding}); }
   scratchStop(){
     if(this._scratchPort) this._scratchPort.postMessage({cmd:'stopScratch'});
     // fade scratch output down slightly to avoid clicks
@@ -212,11 +259,11 @@ export class Deck {
       // create a new source and ensure it routes through a sourceGain
       const s = this._makeSource();
       if(!s) return;
-      const now = this.ctx.currentTime;
-      const CROSSFADE = 0.04; // seconds
-      const PRELOAD_LEAD = 0.016; // schedule source slightly ahead (16ms) so engine can schedule it accurately
+  const now = this.ctx.currentTime;
+  const CROSSFADE = (typeof this.CROSSFADE === 'number') ? this.CROSSFADE : 0.04;
+  const PRELOAD_LEAD = (typeof this.PRELOAD_LEAD === 'number') ? this.PRELOAD_LEAD : 0.016;
       // ensure sourceGain exists and start the source slightly in the future to give audio thread lead time
-      const startTime = Math.max(now + PRELOAD_LEAD, now + 0.001);
+  const startTime = Math.max(now + PRELOAD_LEAD, now + 0.001);
       try{
         // prepare sourceGain fade: start silent at startTime - small epsilon, then ramp to 1 over CROSSFADE
         if(this.sourceGain){
@@ -247,6 +294,10 @@ export class Deck {
       try{ setTimeout(()=>{ try{ if(this.scratchGain) this.scratchGain.gain.setValueAtTime(0, this.ctx.currentTime); }catch(e){} }, Math.ceil((PRELOAD_LEAD + CROSSFADE)*1000)+10); }catch(e){}
     }catch(e){ console.error('[Deck] resumeAtPosition error', e); }
   }
+
+  // runtime setters for knobs (temporary UI use)
+  setPreloadLead(seconds){ this.PRELOAD_LEAD = Math.max(0, Number(seconds) || 0); }
+  setCrossfade(seconds){ this.CROSSFADE = Math.max(0, Number(seconds) || 0); }
 
   pause(){
     const nowMs = Date.now();

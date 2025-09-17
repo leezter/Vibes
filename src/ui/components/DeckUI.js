@@ -65,64 +65,111 @@ export function createDeckUI(container, engine, id){
   let lastScratchPos = null;
   let initialPlatterAngle = 0;
   let pointerStartAngle = 0;
+  let pointerStartRadius = 0;
+  // UI-side smoothing for playbackRate to avoid zipper noise when sending frequent updates
+  let uiLastRate = 1.0;
+  let lastSentMs = 0;
+  let lastMoveTs = 0;
   const getAngle = (clientX, clientY)=>{
     const r = platterWrap.getBoundingClientRect();
     const cx = r.left + r.width/2; const cy = r.top + r.height/2;
     const dx = clientX - cx; const dy = clientY - cy;
     const ang = Math.atan2(dy, dx) * 180 / Math.PI; // degrees
-    return ang;
+    const dist = Math.sqrt(dx*dx + dy*dy);
+    return { ang, dist };
   };
 
   const onPointerDown = (e)=>{
     e.preventDefault(); platterWrap.setPointerCapture && platterWrap.setPointerCapture(e.pointerId);
     isScratching = true; lastTs = performance.now();
     // pointerStartAngle is the angle where the pointer was clicked (for delta tracking)
-    pointerStartAngle = getAngle(e.clientX, e.clientY);
+  const angObj = getAngle(e.clientX, e.clientY);
+  pointerStartAngle = angObj.ang;
+  pointerStartRadius = angObj.dist || 0;
     // remember the platter's current visual angle so rotation is relative to it (no snap)
     try{ initialPlatterAngle = platterComp.getAngle(); }catch(err){ initialPlatterAngle = 0; }
     // set lastAngle for velocity calculations to the initial pointer angle
     lastAngle = pointerStartAngle;
     // if deck is playing, pause the regular BufferSource so only the scratch node produces audio
     const wasPlaying = !!deck.playing;
-    if(wasPlaying){
-      deck.pause();
-    }
+    if(wasPlaying){ deck.stopImmediate(); }
     // stop automatic platter spinning so pointer controls visual
     platterComp.setSpinning(false);
     // initialize scratch node and notify Deck to start scratch from current position
   const pos = deck.getPosition();
-  lastScratchPos = pos;
+    lastScratchPos = pos;
+  // start scratch with zero rate so a pure hold is silent and stops immediately
   deck.scratchStart(pos, 0.0);
+    // reset UI smoothing state
+    uiLastRate = 1.0;
+    lastMoveTs = performance.now();
     // store flag to resume when pointer up
     platterWrap._wasPlayingBeforeScratch = wasPlaying;
   };
   const onPointerMove = (e)=>{
     if(!isScratching) return;
-    const now = performance.now(); const ang = getAngle(e.clientX, e.clientY);
+  const now = performance.now(); const angObj = getAngle(e.clientX, e.clientY);
     const dt = Math.max(1, now - lastTs) / 1000; // s
+    // if pointer moved into an inner deadzone near spindle, ignore to avoid unstable angles
+    const MIN_RADIUS = Math.min(platterWrap.clientWidth, platterWrap.clientHeight) * 0.08; // 8% of platter size
+    // If the pointer moved into the inner deadzone but the drag started outside, ignore to avoid unstable angles
+    if(angObj.dist < MIN_RADIUS && (pointerStartRadius || 0) >= MIN_RADIUS){
+      lastTs = now;
+      return;
+    }
     // compute delta angle in degrees (frame-to-frame), normalize to -180..180
-    let dAng = ang - lastAngle; while(dAng > 180) dAng -= 360; while(dAng < -180) dAng += 360;
+  let dAng = angObj.ang - lastAngle; while(dAng > 180) dAng -= 360; while(dAng < -180) dAng += 360;
+  // small deadzone to suppress tiny jitter (e.g., from radial movement or pointer noise)
+  const HOLD_DEADZONE_DEG = 0.5;
+  const isHoldThisFrame = Math.abs(dAng) < HOLD_DEADZONE_DEG;
+  if(isHoldThisFrame) dAng = 0;
     // angular velocity (deg/sec)
     const vel = dAng / dt;
-    // map angular velocity to playbackRate multiplier relative to native speed
-    const rate = Math.max(-4, Math.min(4, vel / 360 * 2));
-    // update deck scratch playback rate and position
+  // compute rate; clamp to avoid extreme speeds, then lightly smooth
+  const rawRate = Math.max(-4, Math.min(4, vel / 360 * 1.0));
+  let smoothedRate = uiLastRate * 0.3 + rawRate * 0.7; // emphasize responsiveness; worklet also smooths
+  if(isHoldThisFrame){ smoothedRate = 0; }
+  uiLastRate = smoothedRate;
+    
+    // compute new position by integrating angular delta into seconds
     const basePos = (typeof lastScratchPos === 'number') ? lastScratchPos : deck.getPosition();
-    deck.scratchSetRate(rate);
-    // advance/set internal position by a small amount proportional to rotation
-    const dtSeconds = (dAng / 360) * 1;
-    const newPos = Math.max(0, Math.min((deck.buffer?deck.buffer.duration:0), basePos + dtSeconds));
+  const dtSeconds = (dAng / 360) * 1.0; // normal sensitivity
+  const newPos = isHoldThisFrame ? basePos : Math.max(0, Math.min((deck.buffer?deck.buffer.duration:0), basePos + dtSeconds));
     lastScratchPos = newPos;
-    deck.scratchSetPosition(newPos);
+    
+    // track movement timing - detect any movement
+    if(Math.abs(dAng) >= 0.1){ lastMoveTs = performance.now(); }
+    
+    // send rate updates at regular intervals; send position only occasionally to reduce zipper noise
+    const nowMs = performance.now();
+    if(nowMs - lastSentMs >= 15){ // ~66Hz: more frequent zero asserts on holds
+      // Drive hold flag into worklet for deterministic freeze, and push explicit rate
+      deck.scratchSetHold(isHoldThisFrame);
+      deck.scratchSetRate(isHoldThisFrame ? 0 : smoothedRate);
+      lastSentMs = nowMs;
+    }
+    // position correction every ~120ms or when drift is notable; skip when holding
+    if(!onPointerMove._lastPosSend){ onPointerMove._lastPosSend = 0; onPointerMove._lastPosVal = basePos; }
+    if(!isHoldThisFrame && (nowMs - onPointerMove._lastPosSend >= 120 || Math.abs(newPos - onPointerMove._lastPosVal) > 0.02)){
+      deck.scratchSetPosition(newPos);
+      onPointerMove._lastPosSend = nowMs; onPointerMove._lastPosVal = newPos;
+    }
+    // separate check for stopping - zero rate quickly when no movement detected
+    if(nowMs - lastMoveTs > 30 && Math.abs(smoothedRate) > 0.0005){
+      deck.scratchSetRate(0);
+      uiLastRate = 0;
+    }
     // update platter visual angle relative to the platter's initial angle (avoid snapping to pointer)
-    const newVisualAngle = initialPlatterAngle + (ang - pointerStartAngle);
+  const newVisualAngle = initialPlatterAngle + (angObj.ang - pointerStartAngle);
     try{ platterComp.setAngle(newVisualAngle); }catch(e){}
-    lastAngle = ang; lastTs = now;
+    lastAngle = angObj.ang; lastTs = now;
   };
   const onPointerUp = (e)=>{
     if(!isScratching) return; isScratching=false; try{ platterWrap.releasePointerCapture && platterWrap.releasePointerCapture(e.pointerId); }catch(e){}
     // if deck was playing before scratch, resume normal BufferSource playback at the new position
     const finalPos = (typeof lastScratchPos === 'number') ? lastScratchPos : deck.getPosition();
+  // End hold; send a final zero-rate to guarantee worklet freeze
+  try{ deck.scratchSetHold(false); deck.scratchSetRate(0); }catch(_e){}
     if(platterWrap._wasPlayingBeforeScratch){
       // resume at the last position reported by scratch
       deck.resumeAtPosition(finalPos);
@@ -138,7 +185,10 @@ export function createDeckUI(container, engine, id){
   };
   platterWrap.addEventListener('pointerdown', onPointerDown);
   platterWrap.addEventListener('pointermove', onPointerMove);
+  // also track pointer movement globally so drags continue when pointer leaves the platter element
+  window.addEventListener('pointermove', onPointerMove);
   window.addEventListener('pointerup', onPointerUp);
+  window.addEventListener('pointercancel', onPointerUp);
 
   // track whether the user manually changed the BPM slider
   let bpmUserChanged = false;

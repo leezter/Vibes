@@ -62,4 +62,34 @@ window.addEventListener('load', async ()=>{
       e.preventDefault(); console.debug('[main] keyup Q -> cueHoldEnd for activeDeck', activeDeck.id); activeDeck.cueHoldEnd();
     }
   });
+
+  // --- temporary debugging knobs for PRELOAD_LEAD and CROSSFADE (ms) ---
+  (function addTimingKnobs(){
+    const knobsWrap = document.createElement('div');
+    knobsWrap.style.position = 'fixed';
+    knobsWrap.style.right = '12px';
+    knobsWrap.style.top = '12px';
+    knobsWrap.style.background = 'rgba(0,0,0,0.6)';
+    knobsWrap.style.color = '#fff';
+    knobsWrap.style.padding = '8px';
+    knobsWrap.style.borderRadius = '6px';
+    knobsWrap.style.zIndex = '9999';
+    knobsWrap.style.fontSize = '12px';
+    knobsWrap.style.maxWidth = '220px';
+
+    function makeKnob(labelText, initialMs, onChange){
+      const row = document.createElement('div'); row.style.marginBottom='8px';
+      const label = document.createElement('div'); label.textContent = labelText + ': ' + initialMs.toFixed(0) + ' ms'; label.style.marginBottom='4px';
+      const input = document.createElement('input'); input.type='range'; input.min='0'; input.max='200'; input.step='1'; input.value=String(initialMs); input.style.width='180px';
+      input.addEventListener('input', (ev)=>{ const v = Number(ev.target.value); label.textContent = labelText + ': ' + v.toFixed(0) + ' ms'; onChange(v); });
+      row.appendChild(label); row.appendChild(input); return row;
+    }
+
+    const initialPreMs = ((decks.A && decks.A.PRELOAD_LEAD)? decks.A.PRELOAD_LEAD*1000 : 16);
+    const initialXfadeMs = ((decks.A && decks.A.CROSSFADE)? decks.A.CROSSFADE*1000 : 40);
+    const preloadKnob = makeKnob('Preload lead', initialPreMs, (ms)=>{ const s = ms/1000; if(decks.A) decks.A.setPreloadLead(s); if(decks.B) decks.B.setPreloadLead(s); });
+    const xfadeKnob = makeKnob('Crossfade', initialXfadeMs, (ms)=>{ const s = ms/1000; if(decks.A) decks.A.setCrossfade(s); if(decks.B) decks.B.setCrossfade(s); });
+    knobsWrap.appendChild(preloadKnob); knobsWrap.appendChild(xfadeKnob); document.body.appendChild(knobsWrap);
+  })();
+  // --- end knobs ---
 });

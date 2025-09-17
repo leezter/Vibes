@@ -31,12 +31,16 @@ export class AudioEngine {
         // register core worklets; tolerance for failures per-module
         const modules = ['/src/audio/Worklets/Timeworklet.js','/src/audio/Worklets/ScratchProcessor.js'];
         for(const m of modules){
-          try{ await this.ctx.audioWorklet.addModule(m); }
-          catch(e){ console.warn('failed to register worklet', m, e); }
+          try{ 
+            console.debug('[AudioEngine] registering worklet:', m);
+            await this.ctx.audioWorklet.addModule(m); 
+            console.debug('[AudioEngine] successfully registered:', m);
+          }
+          catch(e){ console.warn('[AudioEngine] failed to register worklet', m, e); }
         }
       }
     }catch(e){
-      console.warn('AudioWorklet not available',e);
+      console.warn('[AudioEngine] AudioWorklet not available',e);
     }
   }
 
