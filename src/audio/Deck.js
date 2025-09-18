@@ -75,6 +75,10 @@ export class Deck {
     // timing knobs (defaults)
     this.PRELOAD_LEAD = 0.016; // seconds
     this.CROSSFADE = 0.04; // seconds
+
+    // fling bookkeeping (direction/rate) to inform fallback behavior on flingEnd
+    this._lastFlingDir = 0;   // -1 backward, 0 none, +1 forward
+    this._lastFlingRate = 0;  // last fling rate requested
   }
 
   // Immediately stop audio output and set pausedAt to current position without debounce/op lock.
@@ -96,10 +100,17 @@ export class Deck {
     const arrayBuffer = await file.arrayBuffer();
     this.fileMeta = {name:file.name,size:file.size,lastModified:file.lastModified};
     this.buffer = await this.ctx.decodeAudioData(arrayBuffer.slice(0));
+    // track a buffer key for validating the worklet-side buffer
+    this._bufferKey = this._makeBufferKey();
+    this._scratchNeedsBuffer = true;
+    // If the scratch port already exists, push the new buffer immediately
+    try{ if(this._scratchPort) { this._sendScratchBuffer(); this._scratchNeedsBuffer = false; } }catch(e){}
   // when a buffer is loaded, prepare scratch node if audioWorklet available
   // add small delay to ensure worklet registration is complete
   setTimeout(() => {
     try{ this._ensureScratchNode(); }catch(e){ console.debug('[Deck] scratch node setup failed', e && e.message); }
+    // If scratch node already exists, update its buffer to the newly loaded track
+    try{ if(this._scratchPort){ this._sendScratchBuffer(); this._scratchNeedsBuffer = false; } }catch(e){ console.debug('[Deck] failed to send buffer to scratch after load', e && e.message); }
   }, 100);
     this.pausedAt = 0;
     this.playing = false;
@@ -180,9 +191,13 @@ export class Deck {
               // small delay to avoid overlap with scratch fade
               setTimeout(()=>{
                 const accel = Math.max(0, Number(this._resumeAfterFlingAccelSec)||0);
-                if(accel > 0 && typeof this.resumeAtPositionWithAccel === 'function'){
+                // Forward fling fallback: continue seamlessly at 1.0x (no accel ramp)
+                if(this._lastFlingDir > 0){
+                  this.resumeAtPosition(pos);
+                } else if(accel > 0 && typeof this.resumeAtPositionWithAccel === 'function'){
+                  // Backward (or unknown) fling: prefer accel if configured
                   this.resumeAtPositionWithAccel(pos, accel);
-                }else{
+                } else {
                   this.resumeAtPosition(pos);
                 }
                 this._resumeAfterFling = false; this._resumeAfterFlingAccelSec = 0;
@@ -193,13 +208,7 @@ export class Deck {
       };
       console.debug('[Deck] scratch node created successfully');
       // if buffer already decoded, send channels
-      if(this.buffer){
-        const ch0 = this.buffer.getChannelData(0).slice(0);
-        const ch1 = (this.buffer.numberOfChannels>1) ? this.buffer.getChannelData(1).slice(0) : ch0.slice(0);
-        // transferable arrays
-        this._scratchPort.postMessage({cmd:'setBuffer', channels:[ch0,ch1], sampleRate:this.buffer.sampleRate}, [ch0.buffer, ch1.buffer]);
-        console.debug('[Deck] sent buffer to scratch processor');
-      }
+      if(this.buffer){ this._sendScratchBuffer(); this._scratchNeedsBuffer = false; }
     }catch(e){ 
       console.warn('[Deck] failed to create scratch node', e); 
       // retry once after a short delay in case worklet registration is still pending
@@ -213,9 +222,39 @@ export class Deck {
     }
   }
 
+  // Post the current AudioBuffer to the scratch worklet so scratching uses the active track
+  _sendScratchBuffer(){
+    if(!this._scratchPort || !this.buffer) return;
+    try{
+      const ch0 = this.buffer.getChannelData(0).slice(0);
+      const ch1 = (this.buffer.numberOfChannels>1) ? this.buffer.getChannelData(1).slice(0) : ch0.slice(0);
+      this._scratchPort.postMessage({cmd:'setBuffer', channels:[ch0,ch1], sampleRate:this.buffer.sampleRate}, [ch0.buffer, ch1.buffer]);
+      console.debug('[Deck] sent buffer to scratch processor (update)');
+      // remember what we sent
+      this._scratchSentKey = this._bufferKey || this._makeBufferKey();
+    }catch(e){ console.warn('[Deck] _sendScratchBuffer failed', e); }
+  }
+
+  // Compute a simple key for the current buffer used to detect stale worklet buffers
+  _makeBufferKey(){
+    try{
+      if(this.fileMeta){ return `${this.fileMeta.name}|${this.fileMeta.size}|${this.fileMeta.lastModified}`; }
+      if(this.buffer){ return `${this.buffer.sampleRate}|${this.buffer.length}|${Math.round(this.buffer.duration*1000)}`; }
+    }catch(_e){}
+    return String(Date.now());
+  }
+
   // API for UI to control scratch
   scratchStart(positionSeconds, playbackRate){
     console.debug('[Deck] scratchStart', this.id, 'pos:', positionSeconds, 'rate:', playbackRate);
+    // Ensure worklet has the current track buffer before starting scratch
+    try{
+      const key = this._bufferKey || this._makeBufferKey();
+      if(this._scratchNeedsBuffer || !this._scratchSentKey || this._scratchSentKey !== key){
+        this._sendScratchBuffer();
+        this._scratchNeedsBuffer = false;
+      }
+    }catch(_e){}
     if(this._scratchPort) this._scratchPort.postMessage({cmd:'startScratch', position: positionSeconds, playbackRate});
     // set scratch output audible with a tiny ramp to avoid clicks
     try{
@@ -251,6 +290,9 @@ export class Deck {
     this._resumeAfterFling = !!resumeAfter;
     this._resumeAfterFlingAccelSec = Math.max(0, Number(resumeAccelSec)||0);
     this._resumeScheduledEarly = false;
+    // remember last fling direction/rate for fallback logic
+    this._lastFlingRate = Number(rate)||0;
+    this._lastFlingDir = (this._lastFlingRate > 0) ? 1 : (this._lastFlingRate < 0 ? -1 : 0);
     // store fling prediction data to allow early resume scheduling
     this._flingPredict = {
       startCtxTime: this.ctx.currentTime,
@@ -266,7 +308,7 @@ export class Deck {
       const cur = this.scratchGain.gain.value; this.scratchGain.gain.setValueAtTime(cur, now);
       this.scratchGain.gain.linearRampToValueAtTime(1.0, now + 0.008);
     }catch(_e){}
-    this._scratchPort.postMessage({cmd:'fling', rate, tau});
+  this._scratchPort.postMessage({cmd:'fling', rate, tau});
 
     // schedule early resume (overlap)
     try{
