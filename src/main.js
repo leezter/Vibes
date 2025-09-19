@@ -68,7 +68,8 @@ window.addEventListener('load', async ()=>{
     const knobsWrap = document.createElement('div');
     knobsWrap.style.position = 'fixed';
     knobsWrap.style.right = '12px';
-    knobsWrap.style.top = '12px';
+  // position slightly below the top bar so it doesn't overlap the Dev tools button
+  knobsWrap.style.top = '56px';
     knobsWrap.style.background = 'rgba(0,0,0,0.6)';
     knobsWrap.style.color = '#fff';
     knobsWrap.style.padding = '8px';
@@ -123,7 +124,41 @@ window.addEventListener('load', async ()=>{
     knobsWrap.appendChild(sensKnob);
     knobsWrap.appendChild(maxRateKnob);
     knobsWrap.appendChild(accelDurKnob);
-  document.body.appendChild(knobsWrap);
+    document.body.appendChild(knobsWrap);
+    // expose globally for toggle controls
+    window.VibesDebugPanel = knobsWrap;
   })();
   // --- end knobs ---
+
+  // Dev tools dropdown in topbar (right) to show/hide the debug sliders
+  (function addDevToolsDropdown(){
+    const right = document.querySelector('.topbar .right-status');
+    if(!right) return;
+    const dd = document.createElement('div'); dd.className = 'devtools-dropdown';
+    const btn = document.createElement('button'); btn.className = 'devtools-btn'; btn.textContent = 'Dev tools ▾';
+    const menu = document.createElement('div'); menu.className = 'devtools-menu';
+    const miShow = document.createElement('div'); miShow.className = 'devtools-item'; miShow.textContent = 'Show sliders';
+    const miHide = document.createElement('div'); miHide.className = 'devtools-item'; miHide.textContent = 'Hide sliders';
+    menu.append(miShow, miHide);
+    dd.append(btn, menu);
+    right.appendChild(dd);
+
+    // initial visibility from localStorage
+    const PANEL_KEY = 'vibes.devtools.visible';
+    const setVisible = (vis)=>{
+      const panel = window.VibesDebugPanel; if(!panel) return;
+      panel.style.display = vis ? 'block' : 'none';
+      try{ localStorage.setItem(PANEL_KEY, vis ? '1' : '0'); }catch(e){}
+    };
+    try{
+      const saved = localStorage.getItem(PANEL_KEY);
+      if(saved === '0') setVisible(false);
+    }catch(e){}
+
+    function closeMenu(){ dd.classList.remove('open'); }
+    btn.addEventListener('click', (e)=>{ e.stopPropagation(); dd.classList.toggle('open'); });
+    document.addEventListener('click', closeMenu);
+    miShow.addEventListener('click', (e)=>{ e.stopPropagation(); setVisible(true); closeMenu(); });
+    miHide.addEventListener('click', (e)=>{ e.stopPropagation(); setVisible(false); closeMenu(); });
+  })();
 });
