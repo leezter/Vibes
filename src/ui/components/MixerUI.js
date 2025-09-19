@@ -119,16 +119,50 @@ export function createMixerUI(container, engine, decks){
   const centerKnobs = document.createElement('div'); centerKnobs.className='center-knobs';
   centerKnobs.append(masterKnob, mixKnob, phonesKnob, samplerKnob);
 
-  // VU meter (10 segment)
-  const meter = document.createElement('div'); meter.className='vu-vertical';
-  const segs = []; for(let i=0;i<10;i++){ const s = document.createElement('div'); s.className='vu-seg'; meter.appendChild(s); segs.push(s); }
+  // Two VU meters (10 segment each), side-by-side for Deck A and Deck B
+  const metersWrap = document.createElement('div'); metersWrap.className = 'vu-pair';
+  function makeVu(){
+    const m = document.createElement('div'); m.className = 'vu-vertical';
+    const segs = []; for(let i=0;i<10;i++){ const s = document.createElement('div'); s.className='vu-seg'; m.appendChild(s); segs.push(s); }
+    return { el: m, segs };
+  }
+  const vuA = makeVu();
+  const vuB = makeVu();
+  metersWrap.append(vuA.el, vuB.el);
+
+  // Ensure we remove any legacy horizontal light fillers that might exist
+  // (defensive: if re-rendering or styles changed previously)
+  try{ container.querySelectorAll('.dual-filler,.light-filler').forEach(el=>el.remove()); }catch(_e){}
 
   // Crossfader (horizontal)
   const crossWrap = document.createElement('div'); crossWrap.className = 'crossfader';
   const cross = document.createElement('input'); cross.type='range'; cross.min='0'; cross.max='1'; cross.step='0.001'; cross.value='0.5'; crossWrap.appendChild(cross);
   cross.addEventListener('input',()=>{ state.cross = safeRangeVal(cross, state.cross); updateDeckGains(); });
 
-  center.append(centerKnobs, meter, crossWrap);
+  // Append core pieces; place the two vertical meters between knobs and crossfader
+  center.append(centerKnobs, metersWrap, crossWrap);
+  // Remove any existing dual-fillers anywhere in center to prevent duplicates
+  try{ center.querySelectorAll('.dual-filler').forEach(el=>el.remove()); }catch(_e){}
+  // Defensive cleanup: ensure nothing else sits between the meters and crossfader
+  try{
+    const kids = Array.from(center.children);
+    const metersIdx = kids.indexOf(metersWrap);
+    const crossIdx = kids.indexOf(crossWrap);
+    if(metersIdx >= 0 && crossIdx > metersIdx){
+      for(let i = metersIdx + 1; i < crossIdx; i++){
+        const el = kids[i];
+        if(el) el.remove();
+      }
+    }
+  }catch(_e){}
+  // Ensure no stray dual-filler remains after the crossfader
+  try{
+    const after = Array.from(center.children);
+    const crossIdx2 = after.indexOf(crossWrap);
+    for(let i=crossIdx2+1;i<after.length;i++){
+      if(after[i] && after[i].classList && after[i].classList.contains('dual-filler')) after[i].remove();
+    }
+  }catch(_e){}
 
   // Assemble grid
   grid.append(left.strip, center, right.strip);
@@ -138,23 +172,42 @@ export function createMixerUI(container, engine, decks){
 
   // --- Meter wiring ---
   try{
-    const analyser = engine.ctx.createAnalyser(); analyser.fftSize = 2048; analyser.smoothingTimeConstant = 0.85;
-    engine.master.connect(analyser); // extra tap from master to analyser
-    const buf = new Uint8Array(analyser.frequencyBinCount);
+    // Per-deck meters (post-fader, pre-master)
+    const analyserA = engine.ctx.createAnalyser(); analyserA.fftSize = 1024; analyserA.smoothingTimeConstant = 0.8;
+    const analyserB = engine.ctx.createAnalyser(); analyserB.fftSize = 1024; analyserB.smoothingTimeConstant = 0.8;
+    // connect in parallel; does not affect audio routing
+    try{ decks.A.gain.connect(analyserA); }catch(_e){}
+    try{ decks.B.gain.connect(analyserB); }catch(_e){}
+  const bufA = new Uint8Array(analyserA.frequencyBinCount);
+  const bufB = new Uint8Array(analyserB.frequencyBinCount);
+
+    function levelFromBuf(u8){
+      let sum = 0; for(let i=0;i<u8.length;i++){ const v = (u8[i]-128)/128; sum += v*v; }
+      const rms = Math.sqrt(sum / u8.length);
+      // Map RMS (~0..1) to a UI width percentage with some headroom and soft knee
+      const scaled = Math.min(1, Math.pow(rms * 1.8, 0.85));
+      return Math.round(scaled * 100);
+    }
+
     function tick(){
-      analyser.getByteTimeDomainData(buf);
-      // compute RMS
-      let sum = 0; for(let i=0;i<buf.length;i++){ const v = (buf[i]-128)/128; sum += v*v; }
-      const rms = Math.sqrt(sum / buf.length); // ~0..1
-      // light segments proportionally; last two are red
-      const active = Math.min(10, Math.max(0, Math.round(rms * 14))); // scale for some headroom
+      // Deck A/B vertical meters
+      analyserA.getByteTimeDomainData(bufA);
+      analyserB.getByteTimeDomainData(bufB);
+      const aPct = levelFromBuf(bufA);
+      const bPct = levelFromBuf(bufB);
+      const actA = Math.min(10, Math.max(0, Math.round(aPct / 10)));
+      const actB = Math.min(10, Math.max(0, Math.round(bPct / 10)));
       for(let i=0;i<10;i++){
-        segs[i].classList.toggle('on', i < active);
-        segs[i].classList.toggle('warn', i >= 7 && i < active);
-        segs[i].classList.toggle('clip', i >= 9 && i < active);
+        vuA.segs[i].classList.toggle('on', i < actA);
+        vuA.segs[i].classList.toggle('warn', i >= 7 && i < actA);
+        vuA.segs[i].classList.toggle('clip', i >= 9 && i < actA);
+        vuB.segs[i].classList.toggle('on', i < actB);
+        vuB.segs[i].classList.toggle('warn', i >= 7 && i < actB);
+        vuB.segs[i].classList.toggle('clip', i >= 9 && i < actB);
       }
+
       requestAnimationFrame(tick);
     }
     requestAnimationFrame(tick);
-  }catch(e){ /* analyser optional */ }
+  }catch(e){ /* analysers optional */ }
 }

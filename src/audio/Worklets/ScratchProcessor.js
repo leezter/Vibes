@@ -15,7 +15,9 @@ class ScratchProcessor extends AudioWorkletProcessor {
     this._posSamples = 0.0;       // position in context samples (float)
     this._playbackRate = 1.0;     // target playback rate multiplier
     this._smoothedRate = 1.0;     // smoothed playback rate used per-sample
-  this._rateSmoothing = 0.22;   // smoothing factor (0..1) a bit stronger to reduce zipper noise
+    // Per-sample one-pole smoothing factor for rate changes.
+    // Smaller = more smoothing. ~0.003..0.008 yields ~3-10ms time constant at 48kHz.
+    this._rateSmoothing = 0.0045;
     this._scratchActive = false;  // whether to output audio
   this._hold = false;           // UI indicates current hold state
     // Fling state (coasting after pointer release)
@@ -24,9 +26,18 @@ class ScratchProcessor extends AudioWorkletProcessor {
     this._flingTau = 0.4;    // seconds, exponential decay time constant
     this._flingEndedFlag = false; // used to notify end once per block
 
-  // Small gate envelope to avoid clicks when toggling mute/near-zero
-  this._gateGain = 0.0;   // smoothed output gain (0..1)
-  this._gateTau = 0.001;  // seconds, ~1ms smoothing
+    // Small gate envelope to avoid clicks when toggling mute/near-zero
+    this._gateGain = 0.0;   // smoothed output gain (0..1)
+    // Slightly longer gate to remove edge crackles
+    this._gateTau = 0.008;  // seconds, ~8ms smoothing
+    // Gate hysteresis thresholds to avoid chatter near zero
+    this._zeroEnter = 0.0035; // if below -> consider zero (mute)
+    this._zeroExit  = 0.007;  // if above -> consider active (unmute)
+    this._gateMuted = true;   // current mute state for hysteresis
+
+    // Smooth position corrections to avoid discontinuities from setPosition
+    this._posTargetSamples = null; // when set, we slew toward this position
+    this._posSlewTau = 0.004;      // seconds, ~4ms position slew time constant
 
     this.port.onmessage = this._onMessage.bind(this);
   }
@@ -48,6 +59,7 @@ class ScratchProcessor extends AudioWorkletProcessor {
         const pos = Number(d.position) || 0;
         const rate = (typeof d.playbackRate === 'number') ? d.playbackRate : 0.0;
         this._posSamples = pos * sampleRate;
+        this._posTargetSamples = this._posSamples;
         this._playbackRate = rate;
         this._smoothedRate = rate;
         // cancel any lingering fling
@@ -57,7 +69,9 @@ class ScratchProcessor extends AudioWorkletProcessor {
       }
       case 'setPosition': {
         const pos = Number(d.position) || 0;
-        this._posSamples = pos * sampleRate;
+        // Don't jump immediately; set a target and let the process loop slew toward it
+        const target = pos * sampleRate;
+        this._posTargetSamples = target;
         // ensure we output from the new position
         this._scratchActive = true;
         // if flinging, cancel fling (explicit position set wins)
@@ -98,6 +112,11 @@ class ScratchProcessor extends AudioWorkletProcessor {
         this._flingTau = tau;
         this._playbackRate = r;
         this._smoothedRate = r;
+        // Clear any pending position slewing target so fling isn't opposed
+        this._posTargetSamples = null;
+        // Ensure gate opens promptly and stays unmuted during fling
+        this._gateMuted = false;
+        if(this._gateGain < 0.12) this._gateGain = 0.12; // small head-start without a pop
         this._flingEndedFlag = false;
         try{ this.port.postMessage({cmd:'debug', message:'fling-start', rate:r, tau}); }catch(_e){}
         break;
@@ -122,9 +141,12 @@ class ScratchProcessor extends AudioWorkletProcessor {
     const bufLen = this._bufLen;
     const maxPosSamples = bufLen ? (bufLen / resample) : 0;
 
-  let flingEnded = false;
-  const gateK = 1 - Math.exp(-1 / (sampleRate * this._gateTau));
-    const flingDecayPerSample = (this._flingActive && this._flingTau > 0) ? Math.exp(-1 / (sampleRate * this._flingTau)) : 1.0;
+    let flingEnded = false;
+  // Use a faster gate when flinging so sound appears immediately
+  const gateTau = this._flingActive ? Math.max(0.002, this._gateTau * 0.5) : this._gateTau;
+  const gateK = 1 - Math.exp(-1 / (sampleRate * gateTau));
+  const flingDecayPerSample = (this._flingActive && this._flingTau > 0) ? Math.exp(-1 / (sampleRate * this._flingTau)) : 1.0;
+  const posSlewK = 1 - Math.exp(-1 / (sampleRate * this._posSlewTau));
   for(let i=0;i<frames;i++){
       // Exponential smoothing on playbackRate to reduce zipper noise
       if(this._hold){
@@ -138,18 +160,30 @@ class ScratchProcessor extends AudioWorkletProcessor {
         const clampedTarget = Math.max(-8, Math.min(8, this._playbackRate));
         this._smoothedRate += (clampedTarget - this._smoothedRate) * this._rateSmoothing;
       }
-      const ZERO_TGT = 5e-3; // target near-zero threshold
-      const ZERO_SNAP = 2e-3; // smoothed snap threshold
-      // Snap logic: if target is near zero or smoothed is very small, clamp to 0
-      if(!this._flingActive && (Math.abs(this._playbackRate) < ZERO_TGT || Math.abs(this._smoothedRate) < ZERO_SNAP)){
-        this._smoothedRate = 0.0;
+      // Near-zero detection with hysteresis (no fling)
+      const ZERO_TGT = this._zeroEnter; // for target check
+      if(!this._flingActive){
+        if(Math.abs(this._playbackRate) < ZERO_TGT && Math.abs(this._smoothedRate) < this._zeroEnter){
+          this._smoothedRate = 0.0;
+        }
       }
 
-  // Determine if we should mute output (hold or effectively zero speed when not flinging)
-  const muteNow = this._hold || (!this._flingActive && Math.abs(this._smoothedRate) < ZERO_SNAP);
-  // update gate envelope toward target (0 when muted, 1 when active)
-  const gateTarget = muteNow ? 0.0 : 1.0;
-  this._gateGain += (gateTarget - this._gateGain) * gateK;
+      // Determine mute state with hysteresis
+      if(this._hold){
+        this._gateMuted = true;
+      }else if(this._flingActive){
+        // Always unmute during fling
+        this._gateMuted = false;
+      }else{
+        const mag = Math.abs(this._smoothedRate);
+        if(this._gateMuted){
+          if(mag > this._zeroExit) this._gateMuted = false;
+        }else{
+          if(mag < this._zeroEnter) this._gateMuted = true;
+        }
+      }
+      const gateTarget = this._gateMuted ? 0.0 : 1.0;
+      this._gateGain += (gateTarget - this._gateGain) * gateK;
       // Compute buffer index with resampling
       const bufIndex = this._posSamples * resample;
       const idx = Math.floor(bufIndex);
@@ -158,7 +192,7 @@ class ScratchProcessor extends AudioWorkletProcessor {
       for(let ch=0; ch<numOutCh; ch++){
         const src = this.channels[ch < bufChCount ? ch : 0];
         let s = 0.0;
-        if(!muteNow && src){
+        if(!this._gateMuted && src){
           // 4-point cubic interpolation (Catmull-Rom like) for smoother pitch shifts
           const i0 = Math.max(0, idx - 1);
           const i1 = Math.max(0, Math.min(idx, src.length - 1));
@@ -174,6 +208,8 @@ class ScratchProcessor extends AudioWorkletProcessor {
           const a2 = -0.5*p0 + 0.5*p2;
           const a3 = p1;
           s = ((a0*t + a1)*t + a2)*t + a3;
+          // Clamp to avoid cubic overshoot producing hard clipping
+          if(s > 1) s = 1; else if(s < -1) s = -1;
         } else {
           s = 0.0; // explicit silence during holds/near-zero speeds to avoid DC buzz
         }
@@ -181,15 +217,26 @@ class ScratchProcessor extends AudioWorkletProcessor {
         output[ch][i] = s * this._gateGain;
       }
 
-  // Advance position only when target rate is not near zero; freeze on holds
-  const targetZero = this._hold || (!this._flingActive && Math.abs(this._playbackRate) < ZERO_TGT);
-  if(!targetZero){ this._posSamples += this._smoothedRate; }
+      // Advance position based on smoothed rate unless holding
+  const targetZeroNow = this._hold || (!this._flingActive && this._gateMuted);
+      if(!targetZeroNow){ this._posSamples += this._smoothedRate; }
+  // During fling, make sure position still advances even if gate is momentarily muted by hysteresis
+  if(this._flingActive && this._gateMuted){ this._posSamples += this._smoothedRate; }
+      // Slew toward any target position smoothly to avoid discontinuities
+      if(this._posTargetSamples != null){
+        const dpos = this._posTargetSamples - this._posSamples;
+        // limit excessively large corrections per sample to avoid warping too much
+        this._posSamples += dpos * posSlewK;
+        if(Math.abs(dpos) < 0.25){ // within quarter-sample -> consider reached
+          this._posTargetSamples = null;
+        }
+      }
       if(this._posSamples < 0) this._posSamples = 0;
       if(maxPosSamples && this._posSamples >= maxPosSamples) this._posSamples = maxPosSamples - 1;
       // Update fling decay and termination
       if(this._flingActive){
-  // keep fling rate within sane limits and decay
-  this._flingRate = Math.max(-8, Math.min(8, this._flingRate * flingDecayPerSample));
+        // keep fling rate within sane limits and decay
+        this._flingRate = Math.max(-8, Math.min(8, this._flingRate * flingDecayPerSample));
         if(Math.abs(this._flingRate) < 1e-3){
           this._flingActive = false; this._playbackRate = 0.0; this._smoothedRate = 0.0;
           flingEnded = true;

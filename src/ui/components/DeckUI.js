@@ -234,12 +234,9 @@ export function createDeckUI(container, engine, id){
       deck.scratchSetRate(isHoldThisFrame ? 0 : smoothedRate);
       lastSentMs = nowMs;
     }
-    // position correction every ~120ms or when drift is notable; skip when holding
-    if(!onPointerMove._lastPosSend){ onPointerMove._lastPosSend = 0; onPointerMove._lastPosVal = basePos; }
-    if(!isHoldThisFrame && (nowMs - onPointerMove._lastPosSend >= 120 || Math.abs(newPos - onPointerMove._lastPosVal) > 0.02)){
-      deck.scratchSetPosition(newPos);
-      onPointerMove._lastPosSend = nowMs; onPointerMove._lastPosVal = newPos;
-    }
+    // Note: avoid periodic position corrections while actively scratching to prevent
+    // audible "spring" artifacts (feedback between UI corrections and worklet smoothing).
+    // We rely on rate-only updates during scratch and set the initial position on scratchStart.
     // separate check for stopping - zero rate quickly when no movement detected
     if(nowMs - lastMoveTs > 30 && Math.abs(smoothedRate) > 0.0005){
       deck.scratchSetRate(0);
