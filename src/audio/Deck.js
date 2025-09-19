@@ -584,19 +584,27 @@ export class Deck {
 
   seek(seconds){
     // simple seek; quantize externally if needed
+    if(!this.buffer) return;
     if(this._opLock){ console.debug(`[Deck ${this.id}] seek blocked by op lock`); return; }
     this._opLock = true;
     try{
+      const clamped = Math.max(0, Math.min(seconds, this.buffer.duration));
       if(this.playing){
-        // stop current source and mark as not playing so we can restart
-        if(this.source){ try{ this.source.onended = null; this.source.stop(); }catch(e){} this.source = null; }
+        // stop current source and mark as not playing so we can restart after lock release
+        if(this.source){
+          try{ this.source.onended = null; this.source.stop(); }catch(e){}
+          this.source = null;
+        }
         this.playing = false;
-        this.pausedAt = Math.max(0,Math.min(seconds,this.buffer.duration));
-        this.play();
+        this.pausedAt = clamped;
+        // defer restart slightly to ensure op lock is released before play() is invoked
+        const RESTART_DELAY_MS = 12; // must be > lock release (8ms)
+        setTimeout(()=>{ try{ this.play(); }catch(_e){} }, RESTART_DELAY_MS);
       }else{
-        this.pausedAt = Math.max(0,Math.min(seconds,this.buffer.duration));
+        this.pausedAt = clamped;
       }
     }finally{
+      // release lock shortly after to allow the deferred play() to proceed
       setTimeout(()=>{ this._opLock = false; }, 8);
     }
     this.onUpdate({type:'seek',deck:this.id,position:this.pausedAt});

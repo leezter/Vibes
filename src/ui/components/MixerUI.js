@@ -50,9 +50,14 @@ export function createMixerUI(container, engine, decks){
 
   // --- Utilities for combined gains ---
   let state = { cross: 0.5, aFader: 1.0, bFader: 1.0, master: 1.0 };
+  const clamp01 = (n)=> Math.max(0, Math.min(1, n));
+  const safeRangeVal = (el, fallback)=>{
+    const n = (typeof el.valueAsNumber === 'number') ? el.valueAsNumber : parseFloat(el.value);
+    return Number.isFinite(n) ? clamp01(n) : clamp01(fallback);
+  };
   function updateDeckGains(){
-    const a = Math.max(0, Math.min(1, state.aFader)) * (1 - state.cross);
-    const b = Math.max(0, Math.min(1, state.bFader)) * (state.cross);
+    const a = clamp01(state.aFader) * (1 - clamp01(state.cross));
+    const b = clamp01(state.bFader) * clamp01(state.cross);
     decks.A.setGain(a);
     decks.B.setGain(b);
   }
@@ -79,8 +84,17 @@ export function createMixerUI(container, engine, decks){
     // Vertical fader
     const faderWrap = document.createElement('div'); faderWrap.className='fader-vert';
     const fader = document.createElement('input'); fader.type='range'; fader.min='0'; fader.max='1'; fader.step='0.01'; fader.value='1';
+    // Improve Firefox vertical slider behavior
+    try{ fader.setAttribute('orient','vertical'); }catch(_){}
     faderWrap.appendChild(fader);
-    fader.addEventListener('input',()=>{ if(name==='A'){ state.aFader = parseFloat(fader.value); } else { state.bFader = parseFloat(fader.value); } updateDeckGains(); });
+    fader.addEventListener('input',()=>{
+      if(name==='A'){
+        state.aFader = safeRangeVal(fader, state.aFader);
+      } else {
+        state.bFader = safeRangeVal(fader, state.bFader);
+      }
+      updateDeckGains();
+    });
 
     strip.append(knobRow, cue, faderWrap);
     return { strip, fader };
@@ -112,7 +126,7 @@ export function createMixerUI(container, engine, decks){
   // Crossfader (horizontal)
   const crossWrap = document.createElement('div'); crossWrap.className = 'crossfader';
   const cross = document.createElement('input'); cross.type='range'; cross.min='0'; cross.max='1'; cross.step='0.001'; cross.value='0.5'; crossWrap.appendChild(cross);
-  cross.addEventListener('input',()=>{ state.cross = parseFloat(cross.value); updateDeckGains(); });
+  cross.addEventListener('input',()=>{ state.cross = safeRangeVal(cross, state.cross); updateDeckGains(); });
 
   center.append(centerKnobs, meter, crossWrap);
 
